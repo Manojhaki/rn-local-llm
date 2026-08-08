@@ -154,7 +154,7 @@ than none, because it will be believed.
 |---|---|
 | M0 — Skeleton | **Not started.** No native code exists. `/ios`, `/android`, `/cpp`, `/example`, `/benchmarks` do not exist. This environment has no `xcodebuild`, `sdkmanager`, or `adb` — M0 is unstartable here, not just unstarted. |
 | M1 | Not started. Blocked on M0. |
-| M2 — The operations layer | **Partially started, deliberately out of milestone order** (see "Decisions already made" below). Built so far, as pure TypeScript with no native dependency: the model manifest schema + validation, the model registry, the memory guard's preflight decision logic, checksum-mismatch detection, the download state machine (the orchestration/retry logic, not the transport), and the global load lock (locked decision #4's "one model resident at a time," as a state machine). **Not built:** the downloader's actual I/O (needs native background transfer — URLSession/WorkManager — which needs M0), actual SHA-256 hashing of a file (needs a crypto library — an open dependency decision, see below), OS memory-pressure subscription (needs native), unload-on-background (needs native), and actually loading/unloading a model in a backend (needs M0/M1 — the load lock only tracks *which* model id should be resident, not the native residency itself). |
+| M2 — The operations layer | **Partially started, deliberately out of milestone order** (see "Decisions already made" below). Built so far, as pure TypeScript with no native dependency: the model manifest schema + validation, the model registry, the memory guard's preflight decision logic, checksum-mismatch detection, the download state machine (the orchestration/retry logic, not the transport), and the global load lock (locked decision #4's "one model resident at a time," as a state machine). **Not built:** the downloader's actual I/O and the file-hashing wrapper (both dependencies are chosen — `expo-file-system` + `react-native-quick-crypto`, see "Decisions already made" — but neither is wired up, since that code can't be linked or tested without M0), OS memory-pressure subscription (needs native), unload-on-background (needs native), and actually loading/unloading a model in a backend (needs M0/M1 — the load lock only tracks *which* model id should be resident, not the native residency itself). |
 | M3–M4 | Not started. Blocked on M0 and M2. |
 | Cross-cutting | Typed error union: **done and verified.** All 7 documented kinds (`InsufficientMemory`, `ModelNotFound`, `ChecksumMismatch`, `DownloadInterrupted`, `BackendUnavailable`, `Cancelled`, `ContextOverflow`) have classes; both exhaustiveness guards (`EveryKindHasAClass` in `errors.ts`, `SAMPLES` in `errors.test.ts`) were manually broken and confirmed to fail the build, then restored. |
 
@@ -164,7 +164,8 @@ than none, because it will be believed.
 CLAUDE.md               this file
 README.md               public-facing summary (still the placeholder heading)
 LICENSE                 MIT
-package.json             private, 0.0.0, zero runtime dependencies
+package.json             private, 0.0.0, zero direct runtime deps (2 peerDependencies, unimplemented)
+.npmrc                   omit=peer, so local `npm install` doesn't resolve the peer tree
 tsconfig.json            strict + noUncheckedIndexedAccess + exactOptionalPropertyTypes + noEmit
 src/errors.ts            the typed error union (7 kinds)
 src/errors.test.ts       69 assertions
@@ -174,7 +175,7 @@ src/registry.ts          ModelRegistry: register/resolve/list/fromManifestList
 src/registry.test.ts     7 assertions
 src/memoryGuard.ts       checkMemoryCapability() — pure decision logic, RAM reading itself is native/M0 work
 src/memoryGuard.test.ts  5 assertions
-src/checksum.ts          assertChecksumMatches() — pure comparison, hashing itself needs a crypto dependency
+src/checksum.ts          assertChecksumMatches() — pure comparison; hashing wrapper chosen but not yet written
 src/checksum.test.ts     3 assertions
 src/download.ts          download state machine: transition(state, event) — pure reducer, no I/O or transport
 src/download.test.ts     34 assertions
@@ -239,8 +240,69 @@ calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
   `LocalLlmErrorBase`. Do not remove it as dead code.
 - **`toJSON()` omits `cause`** — it may hold an unserializable native object.
 - **License is MIT.**
-- **Dev dependencies are `typescript` (7.0.2) and `@types/node` (26.2.0), and
-  nothing else.** Runtime dependencies remain zero.
+- **Dev dependencies are `typescript` (7.0.2) and `@types/node` (26.2.0).**
+  Direct runtime dependencies remain zero — the first two native modules
+  (below) are declared as `peerDependencies`, not bundled dependencies, which
+  is the idiomatic shape for an RN library: the consuming app supplies its
+  own resolved/linked versions instead of this package pulling in a second
+  copy. `.npmrc` sets `omit=peer` so a plain `npm install` in this repo
+  doesn't resolve that peer tree — confirmed necessary: a first `npm
+  install` without it auto-installed and locked ~7,400 lines of unused
+  transitive dependencies into `package-lock.json` for code that doesn't
+  exist yet. `--omit=peer` keeps local `node_modules` to just the real
+  devDependencies.
+- **`expo-file-system` (peer, `^57.0.2`) and `react-native-quick-crypto`
+  (peer, `^1.1.6`) were chosen for filesystem I/O and file hashing**,
+  2026-08-08, after installing both and reading their actual `.d.ts` files
+  rather than trusting secondhand docs/blog posts (docs.expo.dev and
+  npmjs.com's package page are both blocked by this environment's egress
+  proxy). What was verified, precisely:
+  - Stable `expo-file-system@57.0.2` ships a `DownloadTask` class covering
+    most of the downloader spec with zero custom native code from this
+    project: `pauseAsync()`/`resumeAsync()`/`cancel()`, a progress callback,
+    `AbortSignal` cancellation, and — the important one — `savable():
+    DownloadPauseState` plus `static fromSavable(state)` to persist a paused
+    download and reconstruct it after a JS restart. On iOS,
+    `sessionType: 'background'` (the default) is a real background
+    `URLSession` that continues while the app is suspended. **On Android the
+    same option is explicitly documented as ignored** — no confirmed
+    `WorkManager`-equivalent true background continuation. That gap needs
+    real-device verification once a toolchain exists; don't assume Android
+    parity with iOS here.
+  - `File` (which implements `Blob`) has `stream(): ReadableStream<Uint8Array>`
+    in the *stable* release — a real chunked read, not a
+    whole-file-into-memory one.
+  - `File.digest()` — the SHA-256 method — **does not exist in any stable
+    release.** It's only in an unpublished canary (`58.0.0-canary-...`),
+    which is peer-dependency-locked to a matching canary of the `expo` core
+    package itself. Decided not to pin a reliability-focused library to a
+    nightly-channel prerelease for this. That's why hashing uses a separate
+    library instead of waiting on this.
+  - `react-native-quick-crypto`'s `createHash(algorithm).update(chunk)...
+    digest('hex')` (its `Hash` class extends Node's `stream.Transform`) is
+    the chosen replacement — confirmed via its real `.d.ts`, chainable,
+    accepts repeated `update()` calls, matching `File.stream()`'s chunks.
+    The design (not yet implemented — see below): pipe `File.stream()`
+    chunks into a `Hash`, avoiding a full read into memory for a
+    multi-gigabyte model file, without needing the canary `digest()` at all.
+  - **Real cost worth naming, not hiding:** `react-native-quick-crypto`
+    peer-depends on `react-native-nitro-modules` (Margelo's own JSI codegen
+    framework, distinct from Expo Modules). Picking both libraries means
+    this project ends up depending on two different native-module
+    frameworks side by side — Expo Modules (via `expo-file-system`) and
+    Nitro Modules (via `react-native-quick-crypto`). Both are legitimate
+    New-Architecture/JSI citizens, but it's a real architectural cost, not a
+    free lunch.
+  - **Nothing importing these was written.** Both are real native modules —
+    they can't be linked, run, or tested without an actual RN/Expo app
+    project (M0), which doesn't exist and can't be built in this
+    environment. Writing a wrapper now would be exactly the kind of
+    unverified code this file's own rules warn against ("say so plainly
+    rather than writing native code blind and calling it done"). The
+    `peerDependencies` entries record the decision; the implementation
+    (`File.stream()` → `Hash.update()` → `digest('hex')`, and a `DownloadTask`
+    wrapper feeding `download.ts`'s `transition()`) is the concrete next
+    step once M0 unblocks this.
 - **Package is ESM (`"type": "module"`) and `private: true`.** Private
   because there's no build yet and native code doesn't exist — publishing now
   would ship a package no app can actually load a model with.
@@ -305,15 +367,28 @@ calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
    emit, and an `exports` map shape — before the package is `private: false`
    or consumable by an app. Not needed yet since M0/the example app don't
    exist to consume it.
-4. **Crypto/hashing dependency for on-device SHA-256.** New — surfaced while
-   building `checksum.ts`. Candidates would need to be evaluated for RN
-   compatibility (New Architecture, no bridge) and bundle size before asking
-   to add one; not evaluated yet.
-5. **Download transport dependency, if any.** Native background transfer
-   likely wants a maintained RN library (e.g. something building on
-   `react-native-background-fetch` or a from-scratch TurboModule) rather than
-   hand-rolled `URLSession`/`WorkManager` glue; not evaluated, and blocked on
-   M0 regardless. Now has a concrete consumer: whatever's chosen needs to
-   drive `download.ts`'s `transition()` by dispatching `progress`,
-   `transferComplete`, and `interrupted` events, and read `resumeFromBytes`
-   back out of persisted state on relaunch.
+4. ~~Crypto/hashing dependency for on-device SHA-256.~~ **Resolved
+   2026-08-08: `react-native-quick-crypto`**, paired with `expo-file-system`'s
+   `File.stream()` for chunked reads (avoiding `File.digest()`, which is
+   canary-only). See "Decisions already made" above for the verified API
+   details and the Nitro-Modules-vs-Expo-Modules cost. Declared as a
+   `peerDependency`; the actual wrapper isn't written yet — blocked on M0
+   (needs a real RN/Expo app to link and test against).
+5. **Download transport, mostly resolved but not fully.** `expo-file-system`'s
+   stable `DownloadTask` (see "Decisions already made") covers pause/resume,
+   progress, cancellation, cross-restart persistence via
+   `savable()`/`fromSavable()`, and confirmed real iOS background transfer.
+   **Still genuinely open:** Android's background-continuation behavior is
+   undocumented/unconfirmed (the `sessionType` option is explicitly ignored
+   there) — needs verification on a real Android device once a toolchain
+   exists, and may still need a supplementary approach (e.g. a foreground
+   service, or accepting that an Android transfer pauses when the app is
+   fully backgrounded rather than continuing) if it turns out not to
+   survive backgrounding the way iOS does. Not implemented yet — same M0
+   blocker as above. Whatever wrapper gets written needs to drive
+   `download.ts`'s `transition()` by dispatching `progress`,
+   `transferComplete`, and `interrupted` events from `DownloadTask`'s
+   callbacks, and translate `DownloadPauseState` into/out of
+   `resumeFromBytes`-shaped persisted state (note: `DownloadPauseState`'s
+   `resumeData` is an opaque platform token, not a raw byte offset — the
+   translation isn't a direct 1:1 mapping and needs care).
