@@ -154,7 +154,7 @@ than none, because it will be believed.
 |---|---|
 | M0 — Skeleton | **Not started.** No native code exists. `/ios`, `/android`, `/cpp`, `/example`, `/benchmarks` do not exist. This environment has no `xcodebuild`, `sdkmanager`, or `adb` — M0 is unstartable here, not just unstarted. |
 | M1 | Not started. Blocked on M0. |
-| M2 — The operations layer | **Partially started, deliberately out of milestone order** (see "Decisions already made" below). Built so far, as pure TypeScript with no native dependency: the model manifest schema + validation, the model registry, the memory guard's preflight decision logic, and checksum-mismatch detection. **Not built:** the downloader (needs native background transfer — URLSession/WorkManager — which needs M0), actual SHA-256 hashing of a file (needs a crypto library — an open dependency decision, see below), OS memory-pressure subscription (needs native), unload-on-background (needs native). |
+| M2 — The operations layer | **Partially started, deliberately out of milestone order** (see "Decisions already made" below). Built so far, as pure TypeScript with no native dependency: the model manifest schema + validation, the model registry, the memory guard's preflight decision logic, checksum-mismatch detection, and the download state machine (the orchestration/retry logic, not the transport). **Not built:** the downloader's actual I/O (needs native background transfer — URLSession/WorkManager — which needs M0), actual SHA-256 hashing of a file (needs a crypto library — an open dependency decision, see below), OS memory-pressure subscription (needs native), unload-on-background (needs native). |
 | M3–M4 | Not started. Blocked on M0 and M2. |
 | Cross-cutting | Typed error union: **done and verified.** All 7 documented kinds (`InsufficientMemory`, `ModelNotFound`, `ChecksumMismatch`, `DownloadInterrupted`, `BackendUnavailable`, `Cancelled`, `ContextOverflow`) have classes; both exhaustiveness guards (`EveryKindHasAClass` in `errors.ts`, `SAMPLES` in `errors.test.ts`) were manually broken and confirmed to fail the build, then restored. |
 
@@ -176,10 +176,12 @@ src/memoryGuard.ts       checkMemoryCapability() — pure decision logic, RAM re
 src/memoryGuard.test.ts  5 assertions
 src/checksum.ts          assertChecksumMatches() — pure comparison, hashing itself needs a crypto dependency
 src/checksum.test.ts     3 assertions
+src/download.ts          download state machine: transition(state, event) — pure reducer, no I/O or transport
+src/download.test.ts     34 assertions
 src/index.ts             public entry point, re-exports the above
 ```
 
-`npm run check` (typecheck + `node --test`) passes: 97 assertions, 0 failures.
+`npm run check` (typecheck + `node --test`) passes: 131 assertions, 0 failures.
 There is still no build step — `tsconfig.json` is `noEmit` and the package is
 `private`. Both still need to change before this can be published or consumed
 by an app; see open question 3 below, which is unresolved.
@@ -252,10 +254,26 @@ calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
   bytes needs a hashing implementation RN doesn't have built in (`node:crypto`
   isn't available on-device); no crypto library has been chosen. This is the
   next real dependency decision, not made here.
-- **The downloader itself was not built.** "True background transfer" is a
-  native requirement (`URLSession` background config, `WorkManager`) — there
-  is no TS-only version of this that would be real rather than a stub, and
-  this file's own working style says a working slice beats a stubbed one.
+- **The downloader's transport was not built.** "True background transfer" is
+  a native requirement (`URLSession` background config, `WorkManager`) —
+  there is no TS-only version of this that would be real rather than a stub,
+  and this file's own working style says a working slice beats a stubbed one.
+- **The download state machine (`download.ts`) is built, and its retry
+  semantics are the part worth remembering:** a transport interruption
+  (`DownloadInterrupted`) resumes on retry from `bytesDownloaded`, because
+  the bytes already on disk are still good; a checksum mismatch
+  (`ChecksumMismatch`) restarts from `0` on retry, because the bytes on disk
+  are exactly the ones that failed verification — resuming would just
+  re-verify the same bad data. `download.test.ts` has an end-to-end test
+  covering both paths in sequence. The reducer also enforces monotonic
+  progress, rejects `transferComplete` before all bytes arrive, and rejects
+  any event that doesn't apply to the current status via
+  `InvalidDownloadTransitionError` (a caller-bug class, not part of
+  `LocalLlmErrorKind` — same reasoning as `ManifestValidationError`). It owns
+  no I/O, no persistence, and no transport; a host layer will need to persist
+  `bytesDownloaded` somewhere durable and pass it back in as `start`'s
+  `resumeFromBytes` after a force-quit — this reducer only proves the shape
+  of that resume is correct, it doesn't implement the persisting.
 
 ## Open questions — decide before building
 
@@ -273,8 +291,11 @@ calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
    building `checksum.ts`. Candidates would need to be evaluated for RN
    compatibility (New Architecture, no bridge) and bundle size before asking
    to add one; not evaluated yet.
-5. **Download transport dependency, if any.** New — surfaced while scoping
-   the downloader. Native background transfer likely wants a maintained RN
-   library (e.g. something building on `react-native-background-fetch` or a
-   from-scratch TurboModule) rather than hand-rolled `URLSession`/`WorkManager`
-   glue; not evaluated, and blocked on M0 regardless.
+5. **Download transport dependency, if any.** Native background transfer
+   likely wants a maintained RN library (e.g. something building on
+   `react-native-background-fetch` or a from-scratch TurboModule) rather than
+   hand-rolled `URLSession`/`WorkManager` glue; not evaluated, and blocked on
+   M0 regardless. Now has a concrete consumer: whatever's chosen needs to
+   drive `download.ts`'s `transition()` by dispatching `progress`,
+   `transferComplete`, and `interrupted` events, and read `resumeFromBytes`
+   back out of persisted state on relaunch.

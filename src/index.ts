@@ -25,3 +25,12 @@ export { ModelRegistry } from './registry.ts';
 export { checkMemoryCapability, type MemoryCapabilityOptions } from './memoryGuard.ts';
 
 export { assertChecksumMatches } from './checksum.ts';
+
+export {
+  initialDownloadState,
+  transition,
+  InvalidDownloadTransitionError,
+  type DownloadState,
+  type DownloadStatus,
+  type DownloadEvent,
+} from './download.ts';

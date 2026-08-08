@@ -21,7 +21,8 @@ That API is the target shape, not something you can install yet — see
 Early and not installable as a package. No native code exists, so no model
 can actually be loaded or run yet. What's implemented so far is pure
 TypeScript: the typed error union, the model manifest schema and validation,
-the model registry, and the memory guard's preflight decision logic.
+the model registry, the memory guard's preflight decision logic, and the
+download state machine's orchestration/retry logic (not its transport).
 
 For what's built, what isn't, and why, see the "Current state" section of
 [`CLAUDE.md`](./CLAUDE.md) — kept up to date as the source of truth.
