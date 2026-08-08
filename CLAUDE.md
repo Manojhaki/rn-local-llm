@@ -154,7 +154,7 @@ than none, because it will be believed.
 |---|---|
 | M0 — Skeleton | **Not started.** No native code exists. `/ios`, `/android`, `/cpp`, `/example`, `/benchmarks` do not exist. This environment has no `xcodebuild`, `sdkmanager`, or `adb` — M0 is unstartable here, not just unstarted. |
 | M1 | Not started. Blocked on M0. |
-| M2 — The operations layer | **Partially started, deliberately out of milestone order** (see "Decisions already made" below). Built so far, as pure TypeScript with no native dependency: the model manifest schema + validation, the model registry, the memory guard's preflight decision logic, checksum-mismatch detection, the download state machine (the orchestration/retry logic, not the transport), and the global load lock (locked decision #4's "one model resident at a time," as a state machine). **Not built:** the downloader's actual I/O and the file-hashing wrapper (both dependencies are chosen — `expo-file-system` + `react-native-quick-crypto`, see "Decisions already made" — but neither is wired up, since that code can't be linked or tested without M0), OS memory-pressure subscription (needs native), unload-on-background (needs native), and actually loading/unloading a model in a backend (needs M0/M1 — the load lock only tracks *which* model id should be resident, not the native residency itself). |
+| M2 — The operations layer | **Partially started, deliberately out of milestone order** (see "Decisions already made" below). Built so far, as pure TypeScript with no native dependency: the model manifest schema + validation, the model registry, the memory guard's preflight decision logic, checksum-mismatch detection, the download state machine (the orchestration/retry logic, not the transport), and the global load lock (locked decision #4's "one model resident at a time," as a state machine). Also built, but **unverified beyond `tsc --noEmit`** since it depends on real native modules this environment can't link or run: `src/hashing.ts`'s `computeSha256()` (`expo-file-system` + `react-native-quick-crypto`, see "Decisions already made"). **Not built:** the `DownloadTask` transport adapter (dependency chosen, wrapper not written — larger unverified surface area than the hashing wrapper, deliberately deferred), OS memory-pressure subscription (needs native), unload-on-background (needs native), and actually loading/unloading a model in a backend (needs M0/M1 — the load lock only tracks *which* model id should be resident, not the native residency itself). |
 | M3–M4 | Not started. Blocked on M0 and M2. |
 | Cross-cutting | Typed error union: **done and verified.** All 7 documented kinds (`InsufficientMemory`, `ModelNotFound`, `ChecksumMismatch`, `DownloadInterrupted`, `BackendUnavailable`, `Cancelled`, `ContextOverflow`) have classes; both exhaustiveness guards (`EveryKindHasAClass` in `errors.ts`, `SAMPLES` in `errors.test.ts`) were manually broken and confirmed to fail the build, then restored. |
 
@@ -164,7 +164,7 @@ than none, because it will be believed.
 CLAUDE.md               this file
 README.md               public-facing summary (still the placeholder heading)
 LICENSE                 MIT
-package.json             private, 0.0.0, zero direct runtime deps (2 peerDependencies, unimplemented)
+package.json             private, 0.0.0, zero direct runtime deps (2 peerDependencies, 2 matching devDependencies)
 .npmrc                   omit=peer, so local `npm install` doesn't resolve the peer tree
 tsconfig.json            strict + noUncheckedIndexedAccess + exactOptionalPropertyTypes + noEmit
 src/errors.ts            the typed error union (7 kinds)
@@ -175,16 +175,18 @@ src/registry.ts          ModelRegistry: register/resolve/list/fromManifestList
 src/registry.test.ts     7 assertions
 src/memoryGuard.ts       checkMemoryCapability() — pure decision logic, RAM reading itself is native/M0 work
 src/memoryGuard.test.ts  5 assertions
-src/checksum.ts          assertChecksumMatches() — pure comparison; hashing wrapper chosen but not yet written
+src/checksum.ts          assertChecksumMatches() — pure comparison logic
 src/checksum.test.ts     3 assertions
 src/download.ts          download state machine: transition(state, event) — pure reducer, no I/O or transport
 src/download.test.ts     34 assertions
 src/loadLock.ts          global load lock: transitionLoadLock(state, event) — pure reducer, no native residency
 src/loadLock.test.ts     20 assertions
-src/index.ts             public entry point, re-exports the above
+src/hashing.ts           computeSha256() via expo-file-system + react-native-quick-crypto — typechecked, never run, not exported from index.ts
+src/index.ts             public entry point, re-exports everything above except hashing.ts
 ```
 
 `npm run check` (typecheck + `node --test`) passes: 151 assertions, 0 failures.
+`hashing.ts` has no test file and isn't exercised by that count — see "Decisions already made" for why.
 There is still no build step — `tsconfig.json` is `noEmit` and the package is
 `private`. Both still need to change before this can be published or consumed
 by an app; see open question 3 below, which is unresolved.
@@ -293,16 +295,37 @@ calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
     Nitro Modules (via `react-native-quick-crypto`). Both are legitimate
     New-Architecture/JSI citizens, but it's a real architectural cost, not a
     free lunch.
-  - **Nothing importing these was written.** Both are real native modules —
-    they can't be linked, run, or tested without an actual RN/Expo app
-    project (M0), which doesn't exist and can't be built in this
-    environment. Writing a wrapper now would be exactly the kind of
-    unverified code this file's own rules warn against ("say so plainly
-    rather than writing native code blind and calling it done"). The
-    `peerDependencies` entries record the decision; the implementation
-    (`File.stream()` → `Hash.update()` → `digest('hex')`, and a `DownloadTask`
-    wrapper feeding `download.ts`'s `transition()`) is the concrete next
-    step once M0 unblocks this.
+  - **`src/hashing.ts` (`computeSha256(file: File): Promise<string>`) is now
+    written** — `File.stream()` piped chunk-by-chunk into
+    `createHash('sha256').update()`, finalized with `.digest('hex')`. Both
+    packages were added as `devDependencies` (in addition to the existing
+    `peerDependencies`) so this typechecks against their real, installed
+    `.d.ts` — `npx tsc --noEmit` passes. **It has never been run.** Both are
+    real native modules that can't be linked or executed without an actual
+    RN/Expo app (M0), which doesn't exist here and can't be built in this
+    environment. There is deliberately no `hashing.test.ts` — a test that
+    can only pass vacuously (or crash importing an unlinked native module
+    under plain Node) is worse than no test, per this file's own testing
+    rules. Typecheck-only verification is the ceiling until M0 exists.
+  - **`hashing.ts` is deliberately not re-exported from `index.ts`.** Every
+    other module in the public barrel is pure TypeScript with zero runtime
+    dependency; statically importing `hashing.ts` from `index.ts` would make
+    the entire public API's import graph require `expo-file-system` and
+    `react-native-quick-crypto` to be resolvable, even for a consumer who
+    only wants the typed errors or a state machine. `hashing.ts` stays a
+    standalone module for now. A proper subpath export (e.g.
+    `rn-local-llm/hashing`) is the real fix — see open question 3, the
+    `exports` map is still undecided.
+  - **The `DownloadTask` adapter (`File.downloadFileAsync`/`DownloadTask` →
+    `download.ts`'s `transition()`) was deliberately not written this
+    round**, unlike the hashing wrapper. It's substantially larger
+    unverified surface area — mapping `DownloadTask`'s pause/resume/cancel
+    states and translating the opaque `DownloadPauseState`/`resumeData` into
+    `resumeFromBytes` involves real judgment calls that are easy to get
+    subtly wrong, and none of it can be checked beyond "does it typecheck"
+    here. Shipping that much unverified logic at once was judged a worse
+    tradeoff than the small, easy-to-reason-about hashing wrapper. Concrete
+    next step, still blocked on M0 for anything beyond typecheck.
 - **Package is ESM (`"type": "module"`) and `private: true`.** Private
   because there's no build yet and native code doesn't exist — publishing now
   would ship a package no app can actually load a model with.
@@ -371,9 +394,10 @@ calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
    2026-08-08: `react-native-quick-crypto`**, paired with `expo-file-system`'s
    `File.stream()` for chunked reads (avoiding `File.digest()`, which is
    canary-only). See "Decisions already made" above for the verified API
-   details and the Nitro-Modules-vs-Expo-Modules cost. Declared as a
-   `peerDependency`; the actual wrapper isn't written yet — blocked on M0
-   (needs a real RN/Expo app to link and test against).
+   details and the Nitro-Modules-vs-Expo-Modules cost. `src/hashing.ts` is
+   written and typechecks against both packages' real, installed `.d.ts` —
+   but has never been run. Verifying it actually works needs a real RN/Expo
+   app (M0), which this environment can't build.
 5. **Download transport, mostly resolved but not fully.** `expo-file-system`'s
    stable `DownloadTask` (see "Decisions already made") covers pause/resume,
    progress, cancellation, cross-restart persistence via

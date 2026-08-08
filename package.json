@@ -20,6 +20,8 @@
   },
   "devDependencies": {
     "@types/node": "26.2.0",
+    "expo-file-system": "57.0.2",
+    "react-native-quick-crypto": "1.1.6",
     "typescript": "7.0.2"
   }
 }
