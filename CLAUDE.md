@@ -152,24 +152,55 @@ than none, because it will be believed.
 
 | Milestone | State |
 |---|---|
-| M0 — Skeleton | **Not started.** No native code exists. `/ios`, `/android`, `/cpp`, `/example`, `/benchmarks` do not exist. |
-| M1–M4 | Not started. |
-| Cross-cutting | Typed error union: **not started.** |
+| M0 — Skeleton | **Not started.** No native code exists. `/ios`, `/android`, `/cpp`, `/example`, `/benchmarks` do not exist. This environment has no `xcodebuild`, `sdkmanager`, or `adb` — M0 is unstartable here, not just unstarted. |
+| M1 | Not started. Blocked on M0. |
+| M2 — The operations layer | **Partially started, deliberately out of milestone order** (see "Decisions already made" below). Built so far, as pure TypeScript with no native dependency: the model manifest schema + validation, the model registry, the memory guard's preflight decision logic, and checksum-mismatch detection. **Not built:** the downloader (needs native background transfer — URLSession/WorkManager — which needs M0), actual SHA-256 hashing of a file (needs a crypto library — an open dependency decision, see below), OS memory-pressure subscription (needs native), unload-on-background (needs native). |
+| M3–M4 | Not started. Blocked on M0 and M2. |
+| Cross-cutting | Typed error union: **done and verified.** All 7 documented kinds (`InsufficientMemory`, `ModelNotFound`, `ChecksumMismatch`, `DownloadInterrupted`, `BackendUnavailable`, `Cancelled`, `ContextOverflow`) have classes; both exhaustiveness guards (`EveryKindHasAClass` in `errors.ts`, `SAMPLES` in `errors.test.ts`) were manually broken and confirmed to fail the build, then restored. |
 
 ## What exists
 
 ```
-README.md            one line: "# rn-local-llm"
+CLAUDE.md               this file
+README.md               public-facing summary (still the placeholder heading)
+LICENSE                 MIT
+package.json             private, 0.0.0, zero runtime dependencies
+tsconfig.json            strict + noUncheckedIndexedAccess + exactOptionalPropertyTypes + noEmit
+src/errors.ts            the typed error union (7 kinds)
+src/errors.test.ts       69 assertions
+src/manifest.ts          ModelManifest type + validateManifest() (hand-rolled, no schema library)
+src/manifest.test.ts     13 assertions
+src/registry.ts          ModelRegistry: register/resolve/list/fromManifestList
+src/registry.test.ts     7 assertions
+src/memoryGuard.ts       checkMemoryCapability() — pure decision logic, RAM reading itself is native/M0 work
+src/memoryGuard.test.ts  5 assertions
+src/checksum.ts          assertChecksumMatches() — pure comparison, hashing itself needs a crypto dependency
+src/checksum.test.ts     3 assertions
+src/index.ts             public entry point, re-exports the above
 ```
 
-Nothing else is in the repo yet: no `CLAUDE.md` (until this commit), no
-`package.json`, no `tsconfig.json`, no `LICENSE`, no `src/` directory, no
-tests, no build. There is no entry point and nothing to `npm install`.
+`npm run check` (typecheck + `node --test`) passes: 97 assertions, 0 failures.
+There is still no build step — `tsconfig.json` is `noEmit` and the package is
+`private`. Both still need to change before this can be published or consumed
+by an app; see open question 3 below, which is unresolved.
 
 ## Verify your environment before planning work
 
-There is no `npm run check` yet — no `package.json` exists to define it. Once
-one is added, re-establish what this environment can actually verify:
+Run `npm run check`. It needs **Node >= 22.18** — tests run on `node:test`
+using native type stripping (confirmed working in this environment on Node
+22.22.2), which is why the repo has no test-runner dependency.
+
+**A gotcha this took a moment to work out:** relative imports must use a
+literal `.ts` extension (e.g. `import { x } from './errors.ts'`), not `.js`.
+`tsconfig.json` sets `allowImportingTsExtensions` to permit this under
+`--noEmit`. The more common TS convention — importing with a `.js` extension
+and letting a bundler or `ts-node`-style loader resolve it to the `.ts` file —
+does **not** work with Node's native type stripping on this Node version: a
+`.js` specifier only resolves to an actual `.js` file, so it throws
+`ERR_MODULE_NOT_FOUND` when only `errors.ts` exists on disk. Confirmed by
+testing both ways before settling on `.ts` imports everywhere in `src/`.
+
+Then establish what you can actually verify beyond the TypeScript layer:
 
 ```
 xcodebuild -version      # iOS builds
@@ -177,28 +208,73 @@ sdkmanager --list        # Android builds
 adb devices               # physical hardware
 ```
 
-**If those are missing, you cannot complete M0, or any milestone.** Definition
-of done items 1 and 2 are unverifiable without them. Say so plainly rather than
-writing native code blind and calling it done.
+**If those are missing, you cannot complete M0, or any milestone that touches
+native code.** This environment has none of them — confirmed by running all
+three and getting nothing back. Definition of done items 1 and 2 are
+unverifiable here. Say so plainly rather than writing native code blind and
+calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
 
 ## Decisions already made — do not silently revisit
 
-None yet beyond what's captured in the "Locked architecture decisions" and
-"Engineering rules" sections above. No code has been written, so no
-implementation-level decisions (error class design, license choice, dev
-dependency list) have been made in practice — those will need to be decided
-when the corresponding work starts.
+- **The M2 ops-layer TypeScript was built ahead of M0**, explicitly, by user
+  decision on 2026-08-08 (open question 1 below is now resolved, not open).
+  The reasoning: this environment has no device and no native toolchain, so
+  M0 cannot be completed here regardless of ordering: building the
+  pure-TypeScript, fully-testable-without-a-device slice of M2 was judged
+  better than writing native scaffolding that couldn't be compiled or run.
+  Revisit this only if the environment changes (a device/toolchain becomes
+  available) or the user says otherwise.
+- **Errors subclass `Error`** rather than being plain union objects, for the
+  reasons the original draft of this section gave: crash-reporter stack
+  capture, `instanceof`, and Sentry/Crashlytics grouping. Verified for real
+  this time — `errors.test.ts` has a dedicated `instanceof` test through a
+  throw/catch, not just direct construction.
+- **`Object.setPrototypeOf(this, new.target.prototype)` in the base
+  constructor**, using `new.target` rather than a hardcoded class — this way
+  it stays correct no matter how many subclass levels sit below
+  `LocalLlmErrorBase`. Do not remove it as dead code.
+- **`toJSON()` omits `cause`** — it may hold an unserializable native object.
+- **License is MIT.**
+- **Dev dependencies are `typescript` (7.0.2) and `@types/node` (26.2.0), and
+  nothing else.** Runtime dependencies remain zero.
+- **Package is ESM (`"type": "module"`) and `private: true`.** Private
+  because there's no build yet and native code doesn't exist — publishing now
+  would ship a package no app can actually load a model with.
+- **Manifest validation is hand-rolled**, not backed by a schema library
+  (zod, ajv, etc.). A validation library is a runtime dependency that hasn't
+  been asked about; the validation logic here is simple enough (flat field
+  checks, one nested `source` object) that hand-rolling it isn't a real cost.
+  Revisit if the schema grows more nested/conditional than this.
+- **Checksum verification is split in two, and only half is built.**
+  `assertChecksumMatches()` in `checksum.ts` is pure comparison logic —
+  given an expected and an actual SHA-256, decide match or
+  `ChecksumMismatchError`. Actually *computing* the actual hash from file
+  bytes needs a hashing implementation RN doesn't have built in (`node:crypto`
+  isn't available on-device); no crypto library has been chosen. This is the
+  next real dependency decision, not made here.
+- **The downloader itself was not built.** "True background transfer" is a
+  native requirement (`URLSession` background config, `WorkManager`) — there
+  is no TS-only version of this that would be real rather than a stub, and
+  this file's own working style says a working slice beats a stubbed one.
 
 ## Open questions — decide before building
 
-1. **Can the ops-layer TypeScript run ahead of M0?** The manifest schema,
-   checksum verification, and download state machine are fully testable with no
-   device, but they are M2, and this brief forbids starting a milestone before
-   the previous one passes on hardware. If your environment has no device, that
-   rule blocks all remaining work. Resolve it explicitly rather than drifting
-   past it.
-2. **Rename before publish.** `rn-local-llm` is a working name and appears in
-   the directory name and the README heading.
-3. **No entry point or build.** Nothing exists yet — package manifest, strict
-   TypeScript config, `exports` map, and build tooling all need to be decided
-   before any code is written.
+1. ~~Can the ops-layer TypeScript run ahead of M0?~~ **Resolved 2026-08-08:
+   yes**, explicitly, given this environment's lack of a device. See
+   "Decisions already made" above.
+2. **Rename before publish.** Still unresolved — user chose to keep
+   `rn-local-llm` for now (decided 2026-08-08) and revisit before publishing.
+3. **No build yet.** `package.json` has no `exports` map and `tsconfig.json`
+   is `noEmit`. Needs a decision — a bundler (tsup, unbuild) vs. plain `tsc`
+   emit, and an `exports` map shape — before the package is `private: false`
+   or consumable by an app. Not needed yet since M0/the example app don't
+   exist to consume it.
+4. **Crypto/hashing dependency for on-device SHA-256.** New — surfaced while
+   building `checksum.ts`. Candidates would need to be evaluated for RN
+   compatibility (New Architecture, no bridge) and bundle size before asking
+   to add one; not evaluated yet.
+5. **Download transport dependency, if any.** New — surfaced while scoping
+   the downloader. Native background transfer likely wants a maintained RN
+   library (e.g. something building on `react-native-background-fetch` or a
+   from-scratch TurboModule) rather than hand-rolled `URLSession`/`WorkManager`
+   glue; not evaluated, and blocked on M0 regardless.

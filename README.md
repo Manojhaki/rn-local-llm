@@ -1,1 +1,40 @@
 # rn-local-llm
+
+Working name. Rename before first publish — see `CLAUDE.md`.
+
+A React Native library for running a small language model **on the device**,
+offline. Inference itself (ExecuTorch, llama.cpp) is a solved problem; this
+library is the operations layer around it — getting the model file onto the
+phone, keeping it there, versioning it, and not crashing a low-memory Android
+device mid-generation.
+
+```ts
+const model = useLocalModel('qwen3-1.7b-q4');
+const reply = await model.generate('Summarize this note: ...');
+```
+
+That API is the target shape, not something you can install yet — see
+**Status** below.
+
+## Status
+
+Early and not installable as a package. No native code exists, so no model
+can actually be loaded or run yet. What's implemented so far is pure
+TypeScript: the typed error union, the model manifest schema and validation,
+the model registry, and the memory guard's preflight decision logic.
+
+For what's built, what isn't, and why, see the "Current state" section of
+[`CLAUDE.md`](./CLAUDE.md) — kept up to date as the source of truth.
+
+## Development
+
+```sh
+npm install
+npm run check   # typecheck + tests
+```
+
+Requires Node >= 22.18.
+
+## License
+
+MIT — see [`LICENSE`](./LICENSE).
