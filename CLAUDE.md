@@ -154,7 +154,7 @@ than none, because it will be believed.
 |---|---|
 | M0 — Skeleton | **Not started.** No native code exists. `/ios`, `/android`, `/cpp`, `/example`, `/benchmarks` do not exist. This environment has no `xcodebuild`, `sdkmanager`, or `adb` — M0 is unstartable here, not just unstarted. |
 | M1 | Not started. Blocked on M0. |
-| M2 — The operations layer | **Partially started, deliberately out of milestone order** (see "Decisions already made" below). Built so far, as pure TypeScript with no native dependency: the model manifest schema + validation, the model registry, the memory guard's preflight decision logic, checksum-mismatch detection, the download state machine (the orchestration/retry logic, not the transport), and the global load lock (locked decision #4's "one model resident at a time," as a state machine). Also built, but **unverified beyond `tsc --noEmit`** since it depends on real native modules this environment can't link or run: `src/hashing.ts`'s `computeSha256()` (`expo-file-system` + `react-native-quick-crypto`, see "Decisions already made"). **Not built:** the `DownloadTask` transport adapter (dependency chosen, wrapper not written — larger unverified surface area than the hashing wrapper, deliberately deferred), OS memory-pressure subscription (needs native), unload-on-background (needs native), and actually loading/unloading a model in a backend (needs M0/M1 — the load lock only tracks *which* model id should be resident, not the native residency itself). |
+| M2 — The operations layer | **Partially started, deliberately out of milestone order** (see "Decisions already made" below). Built so far, as pure TypeScript with no native dependency: the model manifest schema + validation, the model registry, the memory guard's preflight decision logic, checksum-mismatch detection, the download state machine (the orchestration/retry logic, not the transport), and the global load lock (locked decision #4's "one model resident at a time," as a state machine). Also built, but **unverified beyond `tsc --noEmit`** since both depend on real native modules this environment can't link or run: `src/hashing.ts`'s `computeSha256()` and `src/downloadTransport.ts`'s `startDownload()` (`expo-file-system` + `react-native-quick-crypto`, see "Decisions already made"). **Not built:** OS memory-pressure subscription (needs native), unload-on-background (needs native), and actually loading/unloading a model in a backend (needs M0/M1 — the load lock only tracks *which* model id should be resident, not the native residency itself). Also not built: the orchestrator that would actually wire `downloadTransport.ts` → `hashing.ts` → `checksum.ts` → atomic move-into-place into one `downloadModel()` call — each piece exists, nothing has connected them yet. |
 | M3–M4 | Not started. Blocked on M0 and M2. |
 | Cross-cutting | Typed error union: **done and verified.** All 7 documented kinds (`InsufficientMemory`, `ModelNotFound`, `ChecksumMismatch`, `DownloadInterrupted`, `BackendUnavailable`, `Cancelled`, `ContextOverflow`) have classes; both exhaustiveness guards (`EveryKindHasAClass` in `errors.ts`, `SAMPLES` in `errors.test.ts`) were manually broken and confirmed to fail the build, then restored. |
 
@@ -182,11 +182,12 @@ src/download.test.ts     34 assertions
 src/loadLock.ts          global load lock: transitionLoadLock(state, event) — pure reducer, no native residency
 src/loadLock.test.ts     20 assertions
 src/hashing.ts           computeSha256() via expo-file-system + react-native-quick-crypto — typechecked, never run, not exported from index.ts
-src/index.ts             public entry point, re-exports everything above except hashing.ts
+src/downloadTransport.ts startDownload() driving download.ts from a real DownloadTask — typechecked, never run, not exported from index.ts
+src/index.ts             public entry point, re-exports everything above except hashing.ts and downloadTransport.ts
 ```
 
 `npm run check` (typecheck + `node --test`) passes: 151 assertions, 0 failures.
-`hashing.ts` has no test file and isn't exercised by that count — see "Decisions already made" for why.
+`hashing.ts` and `downloadTransport.ts` have no test files and aren't exercised by that count — see "Decisions already made" for why.
 There is still no build step — `tsconfig.json` is `noEmit` and the package is
 `private`. Both still need to change before this can be published or consumed
 by an app; see open question 3 below, which is unresolved.
@@ -316,16 +317,41 @@ calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
     standalone module for now. A proper subpath export (e.g.
     `rn-local-llm/hashing`) is the real fix — see open question 3, the
     `exports` map is still undecided.
-  - **The `DownloadTask` adapter (`File.downloadFileAsync`/`DownloadTask` →
-    `download.ts`'s `transition()`) was deliberately not written this
-    round**, unlike the hashing wrapper. It's substantially larger
-    unverified surface area — mapping `DownloadTask`'s pause/resume/cancel
-    states and translating the opaque `DownloadPauseState`/`resumeData` into
-    `resumeFromBytes` involves real judgment calls that are easy to get
-    subtly wrong, and none of it can be checked beyond "does it typecheck"
-    here. Shipping that much unverified logic at once was judged a worse
-    tradeoff than the small, easy-to-reason-about hashing wrapper. Concrete
-    next step, still blocked on M0 for anything beyond typecheck.
+  - **The `DownloadTask` adapter (`src/downloadTransport.ts`) is now
+    written too**, having initially been deferred as "substantially larger
+    unverified surface area" than the hashing wrapper. The judgment calls
+    that made it risky are made explicitly, not silently:
+    - A `DownloadTask` pause is modeled as `download.ts`'s `interrupted` →
+      `failed` transition, since the reducer has no first-class `paused`
+      status and a paused-but-resumable transfer is exactly what
+      `DownloadInterruptedError` already means there. Resuming a *fresh*
+      transport instance (after a JS restart) goes through `start`'s
+      `resumeFromBytes`, not `retry` — there's no live reducer left to
+      retry from after a process restart, only persisted data.
+    - `PersistedDownloadState` bundles `DownloadPauseState` (the opaque,
+      platform-specific `resumeData` token) together with `bytesDownloaded`
+      tracked separately from the last `progress` event — `savable()`'s
+      output alone doesn't carry a byte count, so persisting only the
+      pause state and not the byte count would silently lose the number
+      `download.ts` needs for `resumeFromBytes`.
+    - `downloadAsync()`/`resumeAsync()` resolving `null` means paused;
+      since `DownloadTask` only enters `paused` through an explicit pause
+      call, that's always a result of this module's own
+      `pauseForBackground()`, whose own return value already tells the
+      caller what it needs — so that branch deliberately returns a promise
+      that never settles rather than manufacturing a fake result.
+    - Rejections are re-thrown as this library's own typed errors
+      (`DownloadInterruptedError`, or `CancelledError` when the rejection
+      followed this module's own `cancel()`), not the raw native rejection
+      reason, so a caller `await`ing `result` gets the same typed-error
+      contract as everywhere else in this library.
+    - Stops at `transferComplete` — checksum verification is deliberately
+      left to the caller (`checksum.ts` + `hashing.ts`, run against the
+      resolved `File`), the same separation of concerns `download.ts`
+      itself already keeps.
+    Same verification ceiling as the hashing wrapper: typechecks against
+    the real `.d.ts`, has never run, no test file, not exported from
+    `index.ts`.
 - **Package is ESM (`"type": "module"`) and `private: true`.** Private
   because there's no build yet and native code doesn't exist — publishing now
   would ship a package no app can actually load a model with.
@@ -402,17 +428,15 @@ calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
    stable `DownloadTask` (see "Decisions already made") covers pause/resume,
    progress, cancellation, cross-restart persistence via
    `savable()`/`fromSavable()`, and confirmed real iOS background transfer.
+   `src/downloadTransport.ts` now wraps it and drives `download.ts`'s
+   `transition()` — typechecked, never run, same M0 ceiling as `hashing.ts`.
    **Still genuinely open:** Android's background-continuation behavior is
    undocumented/unconfirmed (the `sessionType` option is explicitly ignored
    there) — needs verification on a real Android device once a toolchain
    exists, and may still need a supplementary approach (e.g. a foreground
    service, or accepting that an Android transfer pauses when the app is
    fully backgrounded rather than continuing) if it turns out not to
-   survive backgrounding the way iOS does. Not implemented yet — same M0
-   blocker as above. Whatever wrapper gets written needs to drive
-   `download.ts`'s `transition()` by dispatching `progress`,
-   `transferComplete`, and `interrupted` events from `DownloadTask`'s
-   callbacks, and translate `DownloadPauseState` into/out of
-   `resumeFromBytes`-shaped persisted state (note: `DownloadPauseState`'s
-   `resumeData` is an opaque platform token, not a raw byte offset — the
-   translation isn't a direct 1:1 mapping and needs care).
+   survive backgrounding the way iOS does. Also open: nothing yet calls
+   `startDownload()` and sequences `hashing.ts` + `checksum.ts` + an atomic
+   move-into-place after it — that orchestration (the actual `downloadModel()`
+   a consumer would call) doesn't exist yet.

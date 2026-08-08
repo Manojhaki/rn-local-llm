@@ -24,8 +24,10 @@ TypeScript: the typed error union, the model manifest schema and validation,
 the model registry, the memory guard's preflight decision logic, the
 download state machine's orchestration/retry logic (not its transport), and
 the global load lock that enforces one model resident at a time. There's
-also a SHA-256 file-hashing wrapper that typechecks against real native
-dependencies but has never actually been run — see `CLAUDE.md` for why.
+also a SHA-256 file-hashing wrapper and a download-transport adapter that
+typecheck against real native dependencies but have never actually been
+run — see `CLAUDE.md` for why. Nothing wires them together yet, and no
+model has ever been downloaded, loaded, or run.
 
 For what's built, what isn't, and why, see the "Current state" section of
 [`CLAUDE.md`](./CLAUDE.md) — kept up to date as the source of truth.
