@@ -34,3 +34,13 @@ export {
   type DownloadStatus,
   type DownloadEvent,
 } from './download.ts';
+
+export {
+  initialLoadLockState,
+  transitionLoadLock,
+  InvalidLoadLockTransitionError,
+  type LoadLockState,
+  type LoadLockStatus,
+  type LoadLockEvent,
+  type LoadLockTransitionResult,
+} from './loadLock.ts';
