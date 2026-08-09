@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": true,
+    // `allowImportingTsExtensions` (inherited) lets src/ use the literal
+    // `.ts` specifiers Node's type stripping requires. This rewrites them
+    // to `.js` in the emitted JavaScript, which is what actually has to
+    // resolve at runtime. Emitted `.d.ts` files keep the `.ts` specifier —
+    // that is fine and was verified against a real consumer: TypeScript
+    // resolves it to the sibling declaration file.
+    "rewriteRelativeImportExtensions": true
+  },
+  "exclude": ["src/**/*.test.ts"]
+}

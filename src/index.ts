@@ -4,6 +4,7 @@ export {
   ModelNotFoundError,
   ChecksumMismatchError,
   DownloadInterruptedError,
+  InsufficientDiskSpaceError,
   BackendUnavailableError,
   CancelledError,
   ContextOverflowError,
@@ -24,6 +25,8 @@ export { ModelRegistry } from './registry.ts';
 
 export { checkMemoryCapability, type MemoryCapabilityOptions } from './memoryGuard.ts';
 
+export { checkDiskCapacity, type DiskCapacityRequest } from './diskGuard.ts';
+
 export { assertChecksumMatches } from './checksum.ts';
 
 export {
@@ -34,6 +37,18 @@ export {
   type DownloadStatus,
   type DownloadEvent,
 } from './download.ts';
+
+export {
+  downloadModel,
+  type DownloadModelOptions,
+  type DownloadModelResult,
+  type DownloadModelHandle,
+  type ModelTransfer,
+  type TransferRequest,
+  type TransferHandle,
+  type FileHasher,
+  type ModelFileStore,
+} from './downloadModel.ts';
 
 export {
   initialLoadLockState,
