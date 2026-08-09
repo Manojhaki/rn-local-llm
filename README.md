@@ -36,6 +36,9 @@ yet. No model has ever actually been downloaded, loaded, or run.
 
 For what's built, what isn't, and why, see the "Current state" section of
 [`CLAUDE.md`](./CLAUDE.md) — kept up to date as the source of truth.
+[`TESTING.md`](./TESTING.md) covers the eight real-world failure conditions
+this library exists to survive: what's actually tested today, what that
+testing does *not* prove, and the device procedure for each.
 
 ## Development
 

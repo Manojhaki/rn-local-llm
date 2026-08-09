@@ -189,9 +189,10 @@ src/downloadModel.test.ts 40 assertions, all against fakes — no device needed
 src/hashing.ts           computeSha256() via expo-file-system + react-native-quick-crypto — typechecked, never run, not exported from index.ts
 src/downloadTransport.ts ExpoModelTransfer implements downloadModel.ts's ModelTransfer port — typechecked, never run, not exported from index.ts
 src/index.ts             public entry point, re-exports everything above except hashing.ts and downloadTransport.ts
+src/testingDoc.test.ts   4 assertions — verifies TESTING.md's test citations are real, so the doc can't rot silently
 ```
 
-`npm run check` (typecheck + `node --test`) passes: 211 assertions, 0 failures.
+`npm run check` (typecheck + `node --test`) passes: 215 assertions, 0 failures.
 `hashing.ts` and `downloadTransport.ts` have no test files and aren't exercised by that count — see "Decisions already made" for why.
 `npm run build` emits `dist/` via plain `tsc` (no bundler dependency), and
 `npm run check` now runs typecheck + tests + build. The package is still
@@ -359,6 +360,23 @@ calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
     Same verification ceiling as the hashing wrapper: typechecks against
     the real `.d.ts`, has never run, no test file, not exported from
     `index.ts`.
+- **`TESTING.md` records all eight field conditions**, added 2026-08-09,
+  satisfying the Testing section's "every one of them must have a test or a
+  documented manual procedure." For each: what is genuinely covered today
+  (citing test names), what that coverage explicitly does *not* prove, the
+  device procedure, and pass criteria. Two things it surfaced that are worth
+  knowing without reading it: **condition 3 (force-quit resume) will fail
+  today for an implementation reason, not a testing one** — nothing persists
+  `bytesDownloaded` to durable storage, so a resume always restarts from
+  zero; and **conditions 4 and 7 have no procedure at all** because
+  generation doesn't exist, so writing one would be fiction.
+- **`TESTING.md`'s citations are machine-checked** by
+  `src/testingDoc.test.ts`. A document whose value is "here is the evidence"
+  is worthless once a test is renamed underneath it, and this repo's whole
+  posture is that an unverified guarantee is a liability dressed as a
+  feature. The checker was confirmed working by renaming a cited test and
+  watching it fail. It also asserts the citation count is non-trivial, so a
+  parser that silently matches nothing can't make the suite pass vacuously.
 - **The build is plain `tsc`, not a bundler**, decided 2026-08-09. A
   bundler (tsup, unbuild, react-native-builder-bob) would be a new
   devDependency earning nothing here: this package is TypeScript that
