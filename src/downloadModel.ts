@@ -18,6 +18,12 @@
 
 import { assertChecksumMatches } from './checksum.ts';
 import { checkDiskCapacity } from './diskGuard.ts';
+import {
+  shouldPersistProgress,
+  type DownloadJournalWriter,
+  type ProgressMark,
+  type ProgressPersistPolicy,
+} from './downloadJournal.ts';
 import { initialDownloadState, transition, type DownloadState, type DownloadEvent } from './download.ts';
 import { CancelledError, DownloadInterruptedError, type LocalLlmError } from './errors.ts';
 import type { ModelManifest } from './manifest.ts';
@@ -93,6 +99,24 @@ export interface DownloadModelOptions {
    * @default 0
    */
   readonly diskHeadroomBytes?: number;
+  /**
+   * Persists progress so a force-quit can resume instead of restarting.
+   * Without it, this download is only resumable within the life of the
+   * process — see `downloadJournal.ts`.
+   */
+  readonly journal?: DownloadJournalWriter;
+  /** How often to write to the journal. Ignored without a `journal`. */
+  readonly progressPersistPolicy?: ProgressPersistPolicy;
+  /**
+   * Journal writes are best-effort: losing resumability is a far better
+   * outcome than failing a download that is otherwise fine, so a failed
+   * write does not abort the transfer. It is reported here rather than
+   * swallowed — a journal that silently never writes would turn every
+   * force-quit into a full restart with nothing to show why.
+   */
+  readonly onJournalError?: (error: unknown) => void;
+  /** Injected for testability. @default Date.now */
+  readonly now?: () => number;
   readonly onStateChange?: (state: DownloadState) => void;
 }
 
@@ -171,6 +195,37 @@ export function downloadModel(options: DownloadModelOptions): DownloadModelHandl
     return Promise.race([work, cancellationSignal]);
   }
 
+  const now = options.now ?? Date.now;
+  let lastPersisted: ProgressMark | undefined;
+
+  /** Best-effort, never awaited by the transfer — see `onJournalError`. */
+  function persistProgress(bytesDownloaded: number, force = false): void {
+    const journal = options.journal;
+    if (!journal) return;
+
+    const mark: ProgressMark = { bytes: bytesDownloaded, at: now() };
+    if (!force && !shouldPersistProgress(lastPersisted, mark, options.progressPersistPolicy)) {
+      return;
+    }
+    lastPersisted = mark;
+
+    void journal
+      .write({
+        modelId: manifest.id,
+        sha256: manifest.sha256,
+        fileSizeBytes: manifest.fileSizeBytes,
+        tempPath,
+        destinationPath,
+        bytesDownloaded,
+        updatedAt: mark.at,
+      })
+      .catch((error: unknown) => options.onJournalError?.(error));
+  }
+
+  function clearJournal(): void {
+    void options.journal?.clear(manifest.id).catch((error: unknown) => options.onJournalError?.(error));
+  }
+
   function dispatch(event: DownloadEvent): void {
     state = transition(state, event);
     options.onStateChange?.(state);
@@ -216,6 +271,7 @@ export function downloadModel(options: DownloadModelOptions): DownloadModelHandl
         // throwing out of the transport's own callback.
         if (state.status === 'downloading') {
           dispatch({ type: 'progress', bytesDownloaded });
+          persistProgress(bytesDownloaded);
         }
       },
     });
@@ -254,6 +310,11 @@ export function downloadModel(options: DownloadModelOptions): DownloadModelHandl
       // resumed onto. `download.ts` restarts a checksum retry from zero and
       // this is what makes that honest.
       await store.delete(tempPath).catch(() => undefined);
+      // The journal points at a temp file that no longer exists, and its
+      // byte count describes bytes known to be bad. Leaving it would invite
+      // a later launch to "resume" onto nothing.
+      clearJournal();
+      lastPersisted = undefined;
       throw failure();
     }
 
@@ -266,6 +327,9 @@ export function downloadModel(options: DownloadModelOptions): DownloadModelHandl
     }
 
     dispatch({ type: 'checksumVerified' });
+    // The temp file is gone (moved) and the download is done; anything left
+    // in the journal now would describe a download that no longer needs doing.
+    clearJournal();
   }
 
   async function run(): Promise<DownloadModelResult> {
@@ -290,6 +354,12 @@ export function downloadModel(options: DownloadModelOptions): DownloadModelHandl
       totalBytes: manifest.fileSizeBytes,
       resumeFromBytes,
     });
+
+    // Record the entry up front rather than waiting for the first throttled
+    // progress write, so that every in-flight download has a journal row
+    // naming its temp path. Without that, a download interrupted early
+    // leaves an orphaned temp file nothing knows how to reclaim.
+    persistProgress(resumeFromBytes, true);
 
     for (let attempt = 1; ; attempt += 1) {
       try {
