@@ -1,185 +1,128 @@
 /**
- * The download transport adapter: drives `download.ts`'s `transition()`
- * reducer from expo-file-system's real `DownloadTask`.
+ * The real `ModelTransfer` implementation, backed by expo-file-system's
+ * `DownloadTask`.
  *
- * **Unverified beyond `tsc --noEmit`** — same situation as `hashing.ts`.
- * `DownloadTask` is a real native module; it can't be linked or executed
- * without an actual RN/Expo app (M0), which this environment can't build.
- * No test file for the same reason: a test that can only pass vacuously or
- * crash on an unlinked native module is worse than no test. Not exported
- * from `index.ts`, for the same reason as `hashing.ts` — it would make the
- * whole public API require these native packages to be resolvable.
+ * **Unverified beyond `tsc --noEmit`.** `DownloadTask` is a real native
+ * module; it can't be linked or executed without an actual RN/Expo app
+ * (M0), which this environment can't build. No test file, for the same
+ * reason as `hashing.ts`: a test that can only pass vacuously or crash on
+ * an unlinked native module is worse than no test. Not exported from
+ * `index.ts` — that would make the whole public API require these native
+ * packages to be resolvable.
  *
- * What this does NOT do: checksum verification (that's `checksum.ts` +
- * `hashing.ts`, run by the caller against the `File` this resolves with —
- * same separation `download.ts` itself keeps), free-disk precheck,
- * Wi-Fi-only gating, or anything else above the transport. And it inherits
- * `DownloadTask`'s own documented gap: on Android, `sessionType`
- * (requested as `'background'` below) is explicitly ignored — no confirmed
- * true background continuation there. See CLAUDE.md.
+ * Deliberately dumb. All the orchestration — retry semantics, checksum
+ * verification, the atomic move, cancellation policy — lives in
+ * `downloadModel.ts` where it is testable with fakes. This file only turns
+ * a `DownloadTask` into bytes-on-disk plus progress callbacks. An earlier
+ * draft drove `download.ts`'s reducer from in here; that made two separate
+ * owners of one state machine once the orchestrator existed, so it was
+ * cut back to this.
+ *
+ * Known platform gap, inherited from `DownloadTask` itself: `sessionType:
+ * 'background'` is a real background `URLSession` on iOS, but is
+ * explicitly ignored on Android — no confirmed true background
+ * continuation there. See CLAUDE.md.
  */
 
-import {
-  DownloadTask,
-  type DownloadPauseState,
-  type DownloadTaskOptions,
-  type File,
-  type Directory,
-} from 'expo-file-system';
-import { transition, initialDownloadState, type DownloadState, type DownloadEvent } from './download.ts';
-import { CancelledError, DownloadInterruptedError } from './errors.ts';
+import { DownloadTask, type DownloadPauseState, type Directory, type File } from 'expo-file-system';
+import type { ModelTransfer, TransferHandle, TransferRequest } from './downloadModel.ts';
 
 /**
- * Everything needed to resume a download after this transport's in-memory
- * state is gone — a JS restart, or a full force-quit and relaunch.
+ * Everything needed to resume a transfer after this object is gone — a JS
+ * restart, or a force-quit and relaunch.
  *
  * `pauseState` is expo-file-system's opaque, platform-specific resume
- * token (`DownloadPauseState.resumeData`) — it does **not** carry a byte
- * count. `bytesDownloaded` is tracked here separately, from the last
- * `progress` event this transport saw, specifically so it can be handed
- * back to `download.ts`'s `transition()` as `start`'s `resumeFromBytes`.
- * Persisting only one half of this pair loses the other.
+ * token; it carries no byte count of its own. `bytesDownloaded` is tracked
+ * separately from the last progress callback, precisely because
+ * `download.ts` needs that number for `resumeFromBytes` and `savable()`
+ * won't give it. Persisting one half without the other loses the ability
+ * to resume correctly.
  */
-export interface PersistedDownloadState {
+export interface PersistedTransferState {
   readonly pauseState: DownloadPauseState;
   readonly bytesDownloaded: number;
 }
 
-export interface DownloadTransportHandle {
+export interface ExpoModelTransferOptions {
   /**
-   * Cancels the download. A no-op if the transfer already finished, failed,
-   * or was already cancelled — matching `DownloadTask.cancel()`'s own
-   * documented behavior.
+   * Resolves the temp path the orchestrator asked for into the `File` (or
+   * `Directory`) `DownloadTask` wants. Injected rather than constructed
+   * here so this module holds no opinion about where models live.
    */
-  cancel(): void;
-  /**
-   * Pauses the transfer and returns everything needed to resume it later,
-   * including after a full force-quit — call this from an app-background
-   * or termination hook and persist the result. Only valid while the
-   * transfer is actively downloading.
-   *
-   * @throws {Error} if the transfer isn't currently in the `downloading` state.
-   */
-  pauseForBackground(): Promise<PersistedDownloadState>;
+  readonly resolveDestination: (tempPath: string) => File | Directory;
+  /** Restored state from a previous process, if this is a resume. */
+  readonly resumeFrom?: PersistedTransferState;
 }
 
-export interface StartDownloadOptions {
-  readonly modelId: string;
-  readonly url: string;
-  readonly destination: File | Directory;
-  readonly totalBytes: number;
-  /** Present when resuming after a force-quit; omit to start fresh. */
-  readonly resumeFrom?: PersistedDownloadState;
-  /** Called with the new state after every transition — mirror this into `onStateChange`-driven UI or persistence. */
-  readonly onStateChange: (state: DownloadState) => void;
-}
+export class ExpoModelTransfer implements ModelTransfer {
+  readonly #resolveDestination: (tempPath: string) => File | Directory;
+  #resumeFrom: PersistedTransferState | undefined;
+  #task: DownloadTask | undefined;
+  #lastBytesDownloaded = 0;
 
-export interface DownloadStart {
-  readonly handle: DownloadTransportHandle;
-  /**
-   * Resolves with the downloaded file once the transfer completes.
-   * Rejects with a {@link DownloadInterruptedError} on a transport failure
-   * or a {@link CancelledError} on cancellation. Deliberately never settles
-   * while merely paused — see the note on {@link PersistedDownloadState}.
-   */
-  readonly result: Promise<File>;
-}
-
-/**
- * Starts (or resumes, via `resumeFrom`) a download, dispatching
- * `download.ts` events as the real transfer progresses.
- *
- * A `DownloadTask` pause is modeled as `download.ts`'s `interrupted` →
- * `failed` transition, not a new "paused" status: `download.ts` doesn't
- * have one, and a paused-but-resumable transfer is exactly what a
- * `DownloadInterruptedError` already means there. Resuming a fresh
- * transport instance from persisted state goes through `start`'s
- * `resumeFromBytes`, not `retry` — there is no live reducer to retry from
- * after a process restart.
- */
-export function startDownload(options: StartDownloadOptions): DownloadStart {
-  const { modelId, url, destination, totalBytes, resumeFrom, onStateChange } = options;
-
-  let state: DownloadState = resumeFrom
-    ? transition(initialDownloadState(modelId), {
-        type: 'start',
-        totalBytes,
-        resumeFromBytes: resumeFrom.bytesDownloaded,
-      })
-    : transition(initialDownloadState(modelId), { type: 'start', totalBytes });
-  onStateChange(state);
-
-  let cancelledByUs = false;
-
-  function dispatch(event: DownloadEvent): void {
-    state = transition(state, event);
-    onStateChange(state);
+  constructor(options: ExpoModelTransferOptions) {
+    this.#resolveDestination = options.resolveDestination;
+    this.#resumeFrom = options.resumeFrom;
   }
 
-  const taskOptions: DownloadTaskOptions = {
-    sessionType: 'background',
-    onProgress: (progress) => {
-      dispatch({ type: 'progress', bytesDownloaded: progress.bytesWritten });
-    },
-  };
+  start(request: TransferRequest): TransferHandle {
+    this.#lastBytesDownloaded = request.resumeFromBytes;
 
-  const task = resumeFrom
-    ? DownloadTask.fromSavable(resumeFrom.pauseState, taskOptions)
-    : new DownloadTask(url, destination, taskOptions);
+    const taskOptions = {
+      sessionType: 'background' as const,
+      onProgress: (progress: { bytesWritten: number }) => {
+        this.#lastBytesDownloaded = progress.bytesWritten;
+        request.onProgress(progress.bytesWritten);
+      },
+    };
 
-  const result: Promise<File> = (resumeFrom ? task.resumeAsync() : task.downloadAsync()).then(
-    (file) => {
+    // A resume token only applies to the transfer it came from. The
+    // orchestrator restarts from byte zero after a checksum failure, and
+    // reusing a stale token there would resume onto bytes it just deleted.
+    const resumeFrom = request.resumeFromBytes > 0 ? this.#resumeFrom : undefined;
+    this.#resumeFrom = undefined;
+
+    const task = resumeFrom
+      ? DownloadTask.fromSavable(resumeFrom.pauseState, taskOptions)
+      : new DownloadTask(request.url, this.#resolveDestination(request.tempPath), taskOptions);
+    this.#task = task;
+
+    const completed = (resumeFrom ? task.resumeAsync() : task.downloadAsync()).then((file) => {
       if (file === null) {
-        // Paused — always a result of our own pauseForBackground() call,
-        // since DownloadTask only enters `paused` through an explicit
-        // pause request. The caller already has what it needs from that
-        // call's own return value; the transfer hasn't finished or
-        // failed, just suspended, so this deliberately never settles.
-        return new Promise<File>(() => {
-          // intentionally never resolves or rejects
-        });
+        // `null` means paused, which only happens through an explicit
+        // `pauseForBackground()` call. That caller already holds the
+        // resume state it needs, and the transfer is suspended rather than
+        // finished or failed — so this deliberately never settles, leaving
+        // the orchestrator's own cancellation signal in charge.
+        return new Promise<void>(() => undefined);
       }
-      dispatch({ type: 'transferComplete' });
-      return file;
-    },
-    (cause: unknown) => {
-      if (cancelledByUs) {
-        throw new CancelledError('download', { cause });
-      }
-      dispatch({ type: 'interrupted', cause });
-      // `dispatch` just set `state.error` to a DownloadInterruptedError —
-      // reject with that typed error rather than the raw native one, so
-      // callers get the same typed-error contract as the rest of this
-      // library instead of an opaque platform-specific rejection reason.
-      throw state.error instanceof DownloadInterruptedError
-        ? state.error
-        : new DownloadInterruptedError(modelId, state.bytesDownloaded, state.totalBytes, { cause });
+      return undefined;
+    });
+
+    return {
+      cancel: () => {
+        task.cancel();
+      },
+      completed,
+    };
+  }
+
+  /**
+   * Pauses the in-flight transfer and returns state that survives a
+   * force-quit. Call this from an app-background or termination hook and
+   * persist the result; hand it back via
+   * {@link ExpoModelTransferOptions.resumeFrom} on the next launch, along
+   * with `bytesDownloaded` as the orchestrator's `resumeFromBytes`.
+   *
+   * @throws {Error} if no transfer has been started.
+   */
+  async pauseForBackground(): Promise<PersistedTransferState> {
+    const task = this.#task;
+    if (!task) {
+      throw new Error('Cannot pause: no transfer has been started.');
     }
-  );
-
-  const handle: DownloadTransportHandle = {
-    cancel() {
-      if (state.status !== 'downloading' && state.status !== 'verifying') {
-        return;
-      }
-      cancelledByUs = true;
-      dispatch({ type: 'cancel' });
-      task.cancel();
-    },
-
-    async pauseForBackground() {
-      if (state.status !== 'downloading') {
-        throw new Error(
-          `Cannot pause a download in status "${state.status}" — pauseForBackground() only applies while downloading.`
-        );
-      }
-      const bytesDownloaded = state.bytesDownloaded;
-      await task.pauseAsync();
-      const pauseState = task.savable();
-      dispatch({ type: 'interrupted' });
-      return { pauseState, bytesDownloaded };
-    },
-  };
-
-  return { handle, result };
+    const bytesDownloaded = this.#lastBytesDownloaded;
+    await task.pauseAsync();
+    return { pauseState: task.savable(), bytesDownloaded };
+  }
 }

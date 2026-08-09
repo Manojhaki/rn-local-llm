@@ -36,6 +36,18 @@ export {
 } from './download.ts';
 
 export {
+  downloadModel,
+  type DownloadModelOptions,
+  type DownloadModelResult,
+  type DownloadModelHandle,
+  type ModelTransfer,
+  type TransferRequest,
+  type TransferHandle,
+  type FileHasher,
+  type ModelFileStore,
+} from './downloadModel.ts';
+
+export {
   initialLoadLockState,
   transitionLoadLock,
   InvalidLoadLockTransitionError,

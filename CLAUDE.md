@@ -154,7 +154,7 @@ than none, because it will be believed.
 |---|---|
 | M0 — Skeleton | **Not started.** No native code exists. `/ios`, `/android`, `/cpp`, `/example`, `/benchmarks` do not exist. This environment has no `xcodebuild`, `sdkmanager`, or `adb` — M0 is unstartable here, not just unstarted. |
 | M1 | Not started. Blocked on M0. |
-| M2 — The operations layer | **Partially started, deliberately out of milestone order** (see "Decisions already made" below). Built so far, as pure TypeScript with no native dependency: the model manifest schema + validation, the model registry, the memory guard's preflight decision logic, checksum-mismatch detection, the download state machine (the orchestration/retry logic, not the transport), and the global load lock (locked decision #4's "one model resident at a time," as a state machine). Also built, but **unverified beyond `tsc --noEmit`** since both depend on real native modules this environment can't link or run: `src/hashing.ts`'s `computeSha256()` and `src/downloadTransport.ts`'s `startDownload()` (`expo-file-system` + `react-native-quick-crypto`, see "Decisions already made"). **Not built:** OS memory-pressure subscription (needs native), unload-on-background (needs native), and actually loading/unloading a model in a backend (needs M0/M1 — the load lock only tracks *which* model id should be resident, not the native residency itself). Also not built: the orchestrator that would actually wire `downloadTransport.ts` → `hashing.ts` → `checksum.ts` → atomic move-into-place into one `downloadModel()` call — each piece exists, nothing has connected them yet. |
+| M2 — The operations layer | **Partially started, deliberately out of milestone order** (see "Decisions already made" below). Built so far, as pure TypeScript with no native dependency: the model manifest schema + validation, the model registry, the memory guard's preflight decision logic, checksum-mismatch detection, the download state machine (the orchestration/retry logic, not the transport), and the global load lock (locked decision #4's "one model resident at a time," as a state machine). Also built, but **unverified beyond `tsc --noEmit`** since both depend on real native modules this environment can't link or run: `src/hashing.ts`'s `computeSha256()` and `src/downloadTransport.ts`'s `startDownload()` (`expo-file-system` + `react-native-quick-crypto`, see "Decisions already made"). The orchestrator (`downloadModel.ts`) that sequences transfer → hash → checksum → atomic move **is built and genuinely tested** — its ports are injected, so 31 assertions exercise the real retry/cancel/cleanup logic against fakes with no device. **Not built:** free-disk precheck (blocked — needs an error kind that doesn't exist, see open question 6), Wi-Fi-only gating (needs a network-state source, another native dependency decision), OS memory-pressure subscription (needs native), unload-on-background (needs native), and actually loading/unloading a model in a backend (needs M0/M1 — the load lock only tracks *which* model id should be resident, not the native residency itself). |
 | M3–M4 | Not started. Blocked on M0 and M2. |
 | Cross-cutting | Typed error union: **done and verified.** All 7 documented kinds (`InsufficientMemory`, `ModelNotFound`, `ChecksumMismatch`, `DownloadInterrupted`, `BackendUnavailable`, `Cancelled`, `ContextOverflow`) have classes; both exhaustiveness guards (`EveryKindHasAClass` in `errors.ts`, `SAMPLES` in `errors.test.ts`) were manually broken and confirmed to fail the build, then restored. |
 
@@ -181,12 +181,14 @@ src/download.ts          download state machine: transition(state, event) — pu
 src/download.test.ts     34 assertions
 src/loadLock.ts          global load lock: transitionLoadLock(state, event) — pure reducer, no native residency
 src/loadLock.test.ts     20 assertions
+src/downloadModel.ts     the orchestrator: downloadModel() — transfer → hash → checksum → atomic move, ports injected
+src/downloadModel.test.ts 31 assertions, all against fakes — no device needed
 src/hashing.ts           computeSha256() via expo-file-system + react-native-quick-crypto — typechecked, never run, not exported from index.ts
-src/downloadTransport.ts startDownload() driving download.ts from a real DownloadTask — typechecked, never run, not exported from index.ts
+src/downloadTransport.ts ExpoModelTransfer implements downloadModel.ts's ModelTransfer port — typechecked, never run, not exported from index.ts
 src/index.ts             public entry point, re-exports everything above except hashing.ts and downloadTransport.ts
 ```
 
-`npm run check` (typecheck + `node --test`) passes: 151 assertions, 0 failures.
+`npm run check` (typecheck + `node --test`) passes: 182 assertions, 0 failures.
 `hashing.ts` and `downloadTransport.ts` have no test files and aren't exercised by that count — see "Decisions already made" for why.
 There is still no build step — `tsconfig.json` is `noEmit` and the package is
 `private`. Both still need to change before this can be published or consumed
@@ -387,6 +389,48 @@ calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
   `bytesDownloaded` somewhere durable and pass it back in as `start`'s
   `resumeFromBytes` after a force-quit — this reducer only proves the shape
   of that resume is correct, it doesn't implement the persisting.
+- **The orchestrator (`downloadModel.ts`) takes its transport, hasher, and
+  filesystem as injected ports** (`ModelTransfer`, `FileHasher`,
+  `ModelFileStore`). This is the design decision that matters most in this
+  file: it means the orchestration logic — retry semantics, cancellation,
+  temp-file cleanup, the ordering guarantee that nothing reaches the
+  destination before it verifies — is covered by 31 real assertions
+  running against fakes on a machine with no device. It converts what
+  would otherwise have been a third typecheck-only module into genuinely
+  tested logic plus one thin unverified adapter. Prefer this shape for
+  anything else that touches the outside world.
+- **Guarantees `downloadModel.ts` holds, each with a test:** nothing
+  reaches `destinationPath` until its SHA-256 matches the manifest; a
+  checksum failure deletes the temp file *before* retrying (so a retry can
+  never re-verify the same bad bytes, which is what makes `download.ts`'s
+  restart-from-zero honest); a transport failure leaves the temp file
+  alone so the retry resumes; the move happens while still `verifying`, so
+  a failed move lands in `failed` rather than a `complete` that lied.
+- **Cancellation does not trust the transport.** `downloadModel()` races
+  every await against its own cancellation signal rather than just
+  awaiting the transport's promise. Locked decision #5 says everything
+  async is cancellable with no exceptions — awaiting the transport alone
+  would make that only as strong as the transport's manners, and a
+  transport that never settles after `cancel()` would hang forever. There
+  is a test (`cancels even a transport that never settles after cancel()`)
+  using a deliberately badly-behaved fake; it caught this exact bug during
+  development, when the signal existed but was never fired.
+- **Cancelling leaves the partial temp file on disk.** Deleting it would
+  make an explicit cancel unresumable, which is the opposite of what this
+  library is for on a 1.2 GB download over mobile data. Reclaiming temp
+  files is the host's job. Only a *checksum failure* deletes, because
+  those specific bytes are known bad.
+- **`maxAttempts` defaults to 3.** A single network blip should not kill a
+  twenty-minute download, and the reducer already makes retries safe
+  (resume after interruption, restart after checksum failure). Worth
+  revisiting if it ever masks a genuinely stale manifest hash — three
+  full re-downloads of a large file is not free.
+- **`downloadTransport.ts` was rewritten to be dumb.** Its first draft
+  drove `download.ts`'s reducer itself; once the orchestrator existed that
+  made two separate owners of one state machine. It is now just
+  `ExpoModelTransfer implements ModelTransfer` — bytes on disk plus
+  progress callbacks, nothing else. Smaller, and less unverified logic,
+  which is the direction to keep pushing.
 - **The global load lock (`loadLock.ts`) enforces locked decision #4 as a
   state machine: idle → loading → loaded, one model id at a time.** Loading
   a second model *displaces* whatever was loading or resident — it is never
@@ -428,15 +472,31 @@ calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
    stable `DownloadTask` (see "Decisions already made") covers pause/resume,
    progress, cancellation, cross-restart persistence via
    `savable()`/`fromSavable()`, and confirmed real iOS background transfer.
-   `src/downloadTransport.ts` now wraps it and drives `download.ts`'s
-   `transition()` — typechecked, never run, same M0 ceiling as `hashing.ts`.
+   `src/downloadTransport.ts` wraps it as `ExpoModelTransfer`, satisfying
+   `downloadModel.ts`'s `ModelTransfer` port — typechecked, never run, same
+   M0 ceiling as `hashing.ts`. The orchestration above it now exists and is
+   tested (see `downloadModel.ts`).
    **Still genuinely open:** Android's background-continuation behavior is
    undocumented/unconfirmed (the `sessionType` option is explicitly ignored
    there) — needs verification on a real Android device once a toolchain
    exists, and may still need a supplementary approach (e.g. a foreground
    service, or accepting that an Android transfer pauses when the app is
    fully backgrounded rather than continuing) if it turns out not to
-   survive backgrounding the way iOS does. Also open: nothing yet calls
-   `startDownload()` and sequences `hashing.ts` + `checksum.ts` + an atomic
-   move-into-place after it — that orchestration (the actual `downloadModel()`
-   a consumer would call) doesn't exist yet.
+   survive backgrounding the way iOS does.
+6. **The free-disk precheck needs an eighth error kind, and that's a
+   breaking change.** The Downloader spec requires "free-disk precheck
+   before starting, with headroom margin," but `LocalLlmErrorKind` has no
+   member for it — the closest, `DownloadInterrupted`, is semantically
+   wrong (nothing was interrupted; the download never started). Adding
+   `InsufficientDiskSpace` is the right fix, and is the four-edit change
+   this file's "Adding an error kind" section describes — but it is a
+   breaking change for consumers that switch exhaustively, and the working
+   style says to ask before adding public API surface. **Not done — needs
+   a decision.** Until then `downloadModel()` has no precheck, and a
+   disk-full condition surfaces as whatever the transport rejects with,
+   wrapped as `DownloadInterrupted`.
+7. **Wi-Fi-only mode (default) with cellular opt-in isn't built.** It needs
+   a network-state source, which is another native dependency decision
+   (`@react-native-community/netinfo` or equivalent) that hasn't been
+   asked about. The policy itself would be pure, testable logic once a
+   source exists.
