@@ -166,7 +166,8 @@ README.md               public-facing summary (still the placeholder heading)
 LICENSE                 MIT
 package.json             private, 0.0.0, zero direct runtime deps (2 peerDependencies, 2 matching devDependencies)
 .npmrc                   omit=peer, so local `npm install` doesn't resolve the peer tree
-tsconfig.json            strict + noUncheckedIndexedAccess + exactOptionalPropertyTypes + noEmit
+tsconfig.json            strict + noUncheckedIndexedAccess + exactOptionalPropertyTypes + noEmit (dev/typecheck)
+tsconfig.build.json      emit config: dist/, declarations, rewriteRelativeImportExtensions, tests excluded
 src/errors.ts            the typed error union (8 kinds)
 src/errors.test.ts       78 assertions
 src/manifest.ts          ModelManifest type + validateManifest() (hand-rolled, no schema library)
@@ -192,9 +193,11 @@ src/index.ts             public entry point, re-exports everything above except 
 
 `npm run check` (typecheck + `node --test`) passes: 211 assertions, 0 failures.
 `hashing.ts` and `downloadTransport.ts` have no test files and aren't exercised by that count — see "Decisions already made" for why.
-There is still no build step — `tsconfig.json` is `noEmit` and the package is
-`private`. Both still need to change before this can be published or consumed
-by an app; see open question 3 below, which is unresolved.
+`npm run build` emits `dist/` via plain `tsc` (no bundler dependency), and
+`npm run check` now runs typecheck + tests + build. The package is still
+`private: true` — building is not publishing, and shipping a package that
+can't actually load a model would be premature. See open question 3, now
+resolved, for what was verified about the build.
 
 ## Verify your environment before planning work
 
@@ -356,6 +359,44 @@ calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
     Same verification ceiling as the hashing wrapper: typechecks against
     the real `.d.ts`, has never run, no test file, not exported from
     `index.ts`.
+- **The build is plain `tsc`, not a bundler**, decided 2026-08-09. A
+  bundler (tsup, unbuild, react-native-builder-bob) would be a new
+  devDependency earning nothing here: this package is TypeScript that
+  Metro bundles anyway, and there is no CSS, no asset pipeline, and
+  nothing to tree-shake that `sideEffects: false` doesn't already cover.
+  `tsconfig.build.json` extends the dev config, flips `noEmit` off, emits
+  declarations, and excludes `**/*.test.ts`.
+- **`rewriteRelativeImportExtensions` is what makes the `.ts`-specifier
+  convention survive the build.** `src/` must import with literal `.ts`
+  extensions (Node's type stripping demands it — see the environment
+  section). That flag rewrites them to `.js` in emitted JavaScript, which
+  is what has to resolve at runtime. Emitted `.d.ts` files keep the `.ts`
+  specifier; that looked wrong, so it was checked rather than assumed —
+  a real consumer typechecks against it fine, because TypeScript resolves
+  a `.ts` specifier in a declaration file to the sibling `.d.ts`.
+- **The `exports` map has three entries, and the split is the point.**
+  `.` is the pure-TypeScript barrel; `./hashing` and
+  `./download-transport` are the two modules that need native peers. This
+  is what finally lets those two be reachable *without* forcing
+  `expo-file-system` and `react-native-quick-crypto` on someone who only
+  wants the typed errors or a state machine — the problem that previously
+  left them orphaned from `index.ts`. Verified end-to-end against a packed
+  tarball installed into a clean project with no native deps: the barrel
+  imports and runs, both subpaths fail with `ERR_MODULE_NOT_FOUND` (the
+  peer is genuinely absent, exactly as intended), and a deep import like
+  `rn-local-llm/dist/errors.js` is blocked with
+  `ERR_PACKAGE_PATH_NOT_EXPORTED`.
+- **Verified the discriminated union survives the build.** A TypeScript
+  consumer of the packed tarball can write an exhaustive `switch` over all
+  eight error kinds with no `default`, and deleting one case fails that
+  consumer's build. Types crossing a package boundary is exactly the kind
+  of thing that silently degrades, so it was broken on purpose to confirm.
+- **`npm run check` now runs typecheck + tests + build**, so a change that
+  compiles under `--noEmit` but breaks real emit can't pass unnoticed.
+- **No source maps or declaration maps are emitted.** They'd require
+  shipping `src/` to be useful, and this library will be installed by
+  people who care about package size. Cheap to revisit if debugging into
+  the library ever gets painful.
 - **Package is ESM (`"type": "module"`) and `private: true`.** Private
   because there's no build yet and native code doesn't exist — publishing now
   would ship a package no app can actually load a model with.
@@ -496,11 +537,21 @@ enumerates the union by hand and will otherwise go stale.
    "Decisions already made" above.
 2. **Rename before publish.** Still unresolved — user chose to keep
    `rn-local-llm` for now (decided 2026-08-08) and revisit before publishing.
-3. **No build yet.** `package.json` has no `exports` map and `tsconfig.json`
-   is `noEmit`. Needs a decision — a bundler (tsup, unbuild) vs. plain `tsc`
-   emit, and an `exports` map shape — before the package is `private: false`
-   or consumable by an app. Not needed yet since M0/the example app don't
-   exist to consume it.
+3. ~~No build yet.~~ **Resolved 2026-08-09: plain `tsc` emit to `dist/`,
+   with a three-entry `exports` map** (`.`, `./hashing`,
+   `./download-transport`). See "Decisions already made" above for what was
+   verified against a real packed tarball. The package is deliberately
+   still `private: true` — it builds and can be consumed locally (via a
+   `file:` reference, which runs the `prepare` script), but publishing it
+   would ship something that cannot actually load a model until M0/M1
+   exist. Flipping `private` is a separate decision, gated on the rename
+   (question 2) and on there being native code worth shipping.
+   **One thing genuinely untested:** the emitted output is ESM-only, and
+   nothing has run it through Metro. Modern React Native (New
+   Architecture, which is locked decision #1) supports `exports` and ESM,
+   so this should be fine, but "should be" is not "verified" — the example
+   app at M0 is where it gets proven, and a CJS fallback is the fix if it
+   turns out to be needed.
 4. ~~Crypto/hashing dependency for on-device SHA-256.~~ **Resolved
    2026-08-08: `react-native-quick-crypto`**, paired with `expo-file-system`'s
    `File.stream()` for chunked reads (avoiding `File.digest()`, which is

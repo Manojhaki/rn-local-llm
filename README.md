@@ -41,10 +41,23 @@ For what's built, what isn't, and why, see the "Current state" section of
 
 ```sh
 npm install
-npm run check   # typecheck + tests
+npm run check   # typecheck + tests + build
+npm run build   # emit dist/ on its own
 ```
 
 Requires Node >= 22.18.
+
+The package builds with plain `tsc` (no bundler) and exposes three entry
+points. The main one is pure TypeScript with no native dependencies; the
+other two are separated precisely so that stays true:
+
+```ts
+import { downloadModel, ModelRegistry } from 'rn-local-llm';
+import { computeSha256 } from 'rn-local-llm/hashing';              // needs native peers
+import { ExpoModelTransfer } from 'rn-local-llm/download-transport'; // needs native peers
+```
+
+Not published yet — see **Status**.
 
 ## License
 
