@@ -21,6 +21,10 @@
       "types": "./dist/downloadTransport.d.ts",
       "default": "./dist/downloadTransport.js"
     },
+    "./journal-store": {
+      "types": "./dist/downloadJournalStore.d.ts",
+      "default": "./dist/downloadJournalStore.js"
+    },
     "./package.json": "./package.json"
   },
   "main": "./dist/index.js",

@@ -23,16 +23,20 @@ feature that doesn't exist would be fiction.
 |---|---|---|---|---|
 | 1 | Airplane mode toggled mid-download | Yes | No | M0 + device |
 | 2 | Disk fills during download | Partly | No | M0 + device |
-| 3 | App force-quit mid-download, then relaunched | Partly | No | **Unwritten persistence layer**, then M0 |
+| 3 | App force-quit mid-download, then relaunched | Yes | No | M0 + device |
 | 4 | App backgrounded mid-generation | No | No | **M1 — generation does not exist** |
 | 5 | Second model requested while the first is loading | Yes | No | M1 + device |
 | 6 | 4 GB Android device, camera-induced memory pressure | Preflight only | No | **Unwritten pressure subscription**, then M0 |
 | 7 | Thermal throttling during sustained generation | No | No | **M1 — generation does not exist** |
 | 8 | Corrupted model file on disk | Yes | No | M0 (hashing has never run) |
 
-Three of the eight (4, 7, and the second half of 6) cannot have a procedure
-worth writing yet, because the code they would exercise has not been
-written. Those sections say what would have to exist first.
+Two of the eight (4 and 7) cannot have a procedure worth writing yet,
+because the code they would exercise has not been written; the same is true
+of the pressure-subscription half of 6. Those sections say what would have
+to exist first.
+
+Condition 3 was in that category until the download journal was built — it
+is now blocked only on hardware, like most of the rest.
 
 ## Prerequisites for any manual run
 
@@ -152,28 +156,36 @@ a 20-minute download it is close to inevitable.
 - `download.test.ts` — `force-quit mid-download: a fresh state machine can
   resume from persisted progress`, `resumeFromBytes seeds bytesDownloaded,
   modeling a resume after force-quit`
+- `downloadJournal.test.ts` — the reconciliation logic that decides whether
+  a persisted offset can still be trusted: `resumes from the file size when
+  the file is shorter than the journal claims`, `resumes from the journal
+  when the file is longer than the journal claims`, `restarts when the
+  manifest sha256 changed under the same model id`, `restarts when the temp
+  file is gone`, `restarts when the entry is older than maxAgeMs`, `never
+  resumes past the manifest total, even if both disagree upward`
+- `downloadModel.test.ts` — `records an entry before any bytes arrive,
+  naming the temp path`, `records the manifest sha256, so a republished
+  manifest can be detected later`, `clears the entry once the download
+  completes`, `clears the entry on checksum failure, since the temp file was
+  deleted`, `keeps the entry after a transport failure, so the retry can
+  resume`, `a journal write failure does not fail the download`
 - `downloadModel.test.ts` — `passes resumeFromBytes through to the transport
   on a fresh resume`
 
-**Not proven — and this one is an implementation gap, not just a test gap.**
-Both tests above prove the *shape* of a resume is correct if someone hands
-back a byte offset. **Nothing in this repo persists that offset.** The
-reducer holds it in memory, and memory is exactly what a force-quit destroys.
-`downloadTransport.ts`'s `pauseForBackground()` returns a
-`PersistedTransferState` intended for this, but nothing calls it, nothing
-writes it to durable storage, and nothing reads it back on launch. Until
-that host layer exists, this condition **will fail** — not intermittently,
-but always, restarting from zero every time.
+**Previously this section recorded an implementation gap** — nothing
+persisted the byte offset, so every resume restarted from zero. That gap is
+now closed by `downloadJournal.ts` and its store.
 
-`DownloadTask.savable()` / `fromSavable()` have also never been executed, so
-whether the resume token survives process death at all is unknown.
+**Still not proven:** that `ExpoDownloadJournalStore` writes and reads
+anything at all — it has never run. Nor that the journal file survives the
+specific kill the OS performs (as opposed to a graceful background), that
+the write lands before the process dies rather than sitting in a buffer, or
+that `DownloadTask.savable()` / `fromSavable()` produce a token that is
+still valid across process death. The reconciliation *decisions* are
+thoroughly tested; the durability underneath them is entirely unverified,
+and durability is the whole point of this condition.
 
-**Before this can be run, someone must build:** a durable store for
-`PersistedTransferState` + `bytesDownloaded` (written on progress, or at
-minimum on app-background), and launch-time logic that reads it back and
-passes it to `downloadModel()` as `resumeFromBytes`.
-
-**Procedure (once that exists):**
+**Procedure:**
 1. Start a download of the full-size model.
 2. At roughly 40%, force-quit from the app switcher — not a graceful
    background, a genuine kill.

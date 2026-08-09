@@ -51,6 +51,21 @@ export {
 } from './downloadModel.ts';
 
 export {
+  reconcileJournalEntry,
+  shouldPersistProgress,
+  validateJournalEntry,
+  JournalValidationError,
+  type DownloadJournalEntry,
+  type DownloadJournalWriter,
+  type DownloadJournalStore,
+  type JournalReconciliation,
+  type JournalRestartReason,
+  type ReconcileJournalInput,
+  type ProgressMark,
+  type ProgressPersistPolicy,
+} from './downloadJournal.ts';
+
+export {
   initialLoadLockState,
   transitionLoadLock,
   InvalidLoadLockTransitionError,

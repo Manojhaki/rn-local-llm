@@ -15,6 +15,7 @@ import {
   InsufficientDiskSpaceError,
 } from './errors.ts';
 import type { DownloadState } from './download.ts';
+import type { DownloadJournalEntry } from './downloadJournal.ts';
 import type { ModelManifest } from './manifest.ts';
 
 const GOOD_SHA = 'a'.repeat(64);
@@ -546,6 +547,129 @@ describe('downloadModel — free-disk precheck', () => {
     await handle.result;
     assert.equal(harness.store.freeDiskCalls, 1);
     assert.equal(harness.transfer.requests.length, 2);
+  });
+});
+
+describe('downloadModel — journal', () => {
+  class FakeJournal {
+    readonly writes: DownloadJournalEntry[] = [];
+    readonly cleared: string[] = [];
+    writeError: Error | undefined;
+
+    async write(entry: DownloadJournalEntry): Promise<void> {
+      if (this.writeError) throw this.writeError;
+      this.writes.push(entry);
+    }
+
+    async clear(modelId: string): Promise<void> {
+      this.cleared.push(modelId);
+    }
+  }
+
+  /** Journal writes are fire-and-forget, so let their microtasks land. */
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 10; i += 1) await Promise.resolve();
+  }
+
+  function runWithJournal(
+    journal: FakeJournal,
+    opts: { scripts?: Script[]; hashes?: (string | Error)[]; maxAttempts?: number; onJournalError?: (e: unknown) => void } = {}
+  ) {
+    const transfer = new FakeTransfer(opts.scripts ?? [{ kind: 'succeed', emitProgress: TOTAL_BYTES }]);
+    return downloadModel({
+      manifest: manifest(),
+      tempPath: '/tmp/model.gguf.part',
+      destinationPath: '/models/model.gguf',
+      transfer,
+      hasher: new FakeHasher(opts.hashes ?? [GOOD_SHA]),
+      store: new FakeStore(),
+      journal,
+      // No throttling, so every progress event is observable in a test.
+      progressPersistPolicy: { everyBytes: 1, everyMs: 0 },
+      ...(opts.maxAttempts === undefined ? {} : { maxAttempts: opts.maxAttempts }),
+      ...(opts.onJournalError === undefined ? {} : { onJournalError: opts.onJournalError }),
+    });
+  }
+
+  test('records an entry before any bytes arrive, naming the temp path', async () => {
+    const journal = new FakeJournal();
+    await runWithJournal(journal, { scripts: [{ kind: 'succeed' }] }).result;
+    await settle();
+    const first = journal.writes[0];
+    assert.equal(first?.bytesDownloaded, 0);
+    assert.equal(first?.tempPath, '/tmp/model.gguf.part');
+    assert.equal(first?.destinationPath, '/models/model.gguf');
+  });
+
+  test('records the manifest sha256, so a republished manifest can be detected later', async () => {
+    const journal = new FakeJournal();
+    await runWithJournal(journal).result;
+    await settle();
+    assert.equal(journal.writes[0]?.sha256, GOOD_SHA);
+    assert.equal(journal.writes[0]?.fileSizeBytes, TOTAL_BYTES);
+  });
+
+  test('records progress as bytes arrive', async () => {
+    const journal = new FakeJournal();
+    await runWithJournal(journal, { scripts: [{ kind: 'succeed', emitProgress: 600 }] }).result;
+    await settle();
+    assert.ok(journal.writes.some((w) => w.bytesDownloaded === 600));
+  });
+
+  test('clears the entry once the download completes', async () => {
+    const journal = new FakeJournal();
+    await runWithJournal(journal).result;
+    await settle();
+    assert.deepEqual(journal.cleared, ['qwen3-1.7b-q4']);
+  });
+
+  test('clears the entry on checksum failure, since the temp file was deleted', async () => {
+    const journal = new FakeJournal();
+    const handle = runWithJournal(journal, { hashes: [BAD_SHA], maxAttempts: 1 });
+    await assert.rejects(handle.result);
+    await settle();
+    assert.deepEqual(journal.cleared, ['qwen3-1.7b-q4']);
+  });
+
+  test('keeps the entry after a transport failure, so the retry can resume', async () => {
+    const journal = new FakeJournal();
+    const handle = runWithJournal(journal, { scripts: [{ kind: 'fail' }], maxAttempts: 1 });
+    await assert.rejects(handle.result);
+    await settle();
+    assert.deepEqual(journal.cleared, []);
+  });
+
+  test('keeps the entry after cancellation, matching the kept temp file', async () => {
+    const journal = new FakeJournal();
+    const handle = runWithJournal(journal, { scripts: [{ kind: 'pending' }] });
+    await settle();
+    handle.cancel();
+    await assert.rejects(handle.result);
+    await settle();
+    assert.deepEqual(journal.cleared, []);
+  });
+
+  test('a journal write failure does not fail the download', async () => {
+    const journal = new FakeJournal();
+    journal.writeError = new Error('storage full');
+    const result = await runWithJournal(journal).result;
+    assert.equal(result.path, '/models/model.gguf');
+  });
+
+  test('a journal write failure is reported rather than swallowed', async () => {
+    const journal = new FakeJournal();
+    journal.writeError = new Error('storage full');
+    const seen: unknown[] = [];
+    await runWithJournal(journal, { onJournalError: (e) => seen.push(e) }).result;
+    await settle();
+    assert.equal(seen.length > 0, true);
+    assert.equal((seen[0] as Error).message, 'storage full');
+  });
+
+  test('works with no journal at all — it stays optional', async () => {
+    const { handle } = run();
+    const result = await handle.result;
+    assert.equal(result.path, '/models/model.gguf');
   });
 });
 

@@ -154,7 +154,7 @@ than none, because it will be believed.
 |---|---|
 | M0 — Skeleton | **Not started.** No native code exists. `/ios`, `/android`, `/cpp`, `/example`, `/benchmarks` do not exist. This environment has no `xcodebuild`, `sdkmanager`, or `adb` — M0 is unstartable here, not just unstarted. |
 | M1 | Not started. Blocked on M0. |
-| M2 — The operations layer | **Partially started, deliberately out of milestone order** (see "Decisions already made" below). Built so far, as pure TypeScript with no native dependency: the model manifest schema + validation, the model registry, the memory guard's preflight decision logic, checksum-mismatch detection, the download state machine (the orchestration/retry logic, not the transport), and the global load lock (locked decision #4's "one model resident at a time," as a state machine). Also built, but **unverified beyond `tsc --noEmit`** since both depend on real native modules this environment can't link or run: `src/hashing.ts`'s `computeSha256()` and `src/downloadTransport.ts`'s `startDownload()` (`expo-file-system` + `react-native-quick-crypto`, see "Decisions already made"). The orchestrator (`downloadModel.ts`) that sequences transfer → hash → checksum → atomic move **is built and genuinely tested** — its ports are injected, so 31 assertions exercise the real retry/cancel/cleanup logic against fakes with no device. The free-disk precheck (`diskGuard.ts` + an eighth error kind, `InsufficientDiskSpace`) is built and tested too. **Not built:** Wi-Fi-only gating (needs a network-state source, another native dependency decision), OS memory-pressure subscription (needs native), unload-on-background (needs native), and actually loading/unloading a model in a backend (needs M0/M1 — the load lock only tracks *which* model id should be resident, not the native residency itself). |
+| M2 — The operations layer | **Partially started, deliberately out of milestone order** (see "Decisions already made" below). Built so far, as pure TypeScript with no native dependency: the model manifest schema + validation, the model registry, the memory guard's preflight decision logic, checksum-mismatch detection, the download state machine (the orchestration/retry logic, not the transport), and the global load lock (locked decision #4's "one model resident at a time," as a state machine). Also built, but **unverified beyond `tsc --noEmit`** since both depend on real native modules this environment can't link or run: `src/hashing.ts`'s `computeSha256()` and `src/downloadTransport.ts`'s `startDownload()` (`expo-file-system` + `react-native-quick-crypto`, see "Decisions already made"). The orchestrator (`downloadModel.ts`) that sequences transfer → hash → checksum → atomic move **is built and genuinely tested** — its ports are injected, so 31 assertions exercise the real retry/cancel/cleanup logic against fakes with no device. The free-disk precheck (`diskGuard.ts` + an eighth error kind, `InsufficientDiskSpace`) is built and tested too, as is the download journal (`downloadJournal.ts`) that makes force-quit resume real rather than aspirational. **Not built:** Wi-Fi-only gating (needs a network-state source, another native dependency decision), OS memory-pressure subscription (needs native), unload-on-background (needs native), and actually loading/unloading a model in a backend (needs M0/M1 — the load lock only tracks *which* model id should be resident, not the native residency itself). |
 | M3–M4 | Not started. Blocked on M0 and M2. |
 | Cross-cutting | Typed error union: **done and verified.** All 7 documented kinds (`InsufficientMemory`, `ModelNotFound`, `ChecksumMismatch`, `DownloadInterrupted`, `BackendUnavailable`, `Cancelled`, `ContextOverflow`) have classes; both exhaustiveness guards (`EveryKindHasAClass` in `errors.ts`, `SAMPLES` in `errors.test.ts`) were manually broken and confirmed to fail the build, then restored. |
 
@@ -185,15 +185,18 @@ src/download.test.ts     34 assertions
 src/loadLock.ts          global load lock: transitionLoadLock(state, event) — pure reducer, no native residency
 src/loadLock.test.ts     20 assertions
 src/downloadModel.ts     the orchestrator: downloadModel() — transfer → hash → checksum → atomic move, ports injected
-src/downloadModel.test.ts 40 assertions, all against fakes — no device needed
+src/downloadModel.test.ts 50 assertions, all against fakes — no device needed
+src/downloadJournal.ts   the force-quit resume layer: reconcileJournalEntry() + write throttle + validation
+src/downloadJournal.test.ts 33 assertions
 src/hashing.ts           computeSha256() via expo-file-system + react-native-quick-crypto — typechecked, never run, not exported from index.ts
 src/downloadTransport.ts ExpoModelTransfer implements downloadModel.ts's ModelTransfer port — typechecked, never run, not exported from index.ts
+src/downloadJournalStore.ts ExpoDownloadJournalStore, one JSON file per model — typechecked, never run, not exported from index.ts
 src/index.ts             public entry point, re-exports everything above except hashing.ts and downloadTransport.ts
 src/testingDoc.test.ts   4 assertions — verifies TESTING.md's test citations are real, so the doc can't rot silently
 ```
 
-`npm run check` (typecheck + `node --test`) passes: 215 assertions, 0 failures.
-`hashing.ts` and `downloadTransport.ts` have no test files and aren't exercised by that count — see "Decisions already made" for why.
+`npm run check` (typecheck + `node --test`) passes: 258 assertions, 0 failures.
+`hashing.ts`, `downloadTransport.ts`, and `downloadJournalStore.ts` have no test files and aren't exercised by that count — see "Decisions already made" for why.
 `npm run build` emits `dist/` via plain `tsc` (no bundler dependency), and
 `npm run check` now runs typecheck + tests + build. The package is still
 `private: true` — building is not publishing, and shipping a package that
@@ -360,16 +363,50 @@ calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
     Same verification ceiling as the hashing wrapper: typechecks against
     the real `.d.ts`, has never run, no test file, not exported from
     `index.ts`.
+- **The download journal (`downloadJournal.ts`) closes the force-quit gap**,
+  built 2026-08-09 — the downloader spec's "survives force-quit mid-download
+  and resumes on next launch" was previously false in a way no test caught,
+  because the byte offset lived only in memory. Points worth keeping:
+  - **No new dependency.** `expo-file-system` was already a peer, and a
+    small JSON file per model is the right shape. A key-value store (MMKV,
+    AsyncStorage) would have meant a second storage dependency for a few
+    hundred bytes per in-flight download.
+  - **One file per model, not a shared index.** Two concurrent downloads
+    writing one file would race, and a torn write to a shared index loses
+    every entry rather than one.
+  - **`reconcileJournalEntry()` is where the real logic is**, and it is pure
+    and fully tested. Persisting a number is easy; deciding on the next
+    launch whether that number can still be trusted is not. It restarts on a
+    changed manifest `sha256` (the dangerous case — resuming would build a
+    file that can never verify, and you'd only find out after hashing a
+    gigabyte), on a missing temp file, on an expired entry, and when nothing
+    usable is on disk.
+  - **It resumes from the *minimum* of the journal, the actual file size,
+    and the manifest total.** The journal is written on a throttle, so after
+    a crash the file can hold more than the journal recorded — and those
+    extra bytes are the ones most likely to be a torn partial write.
+    Re-fetching a few kilobytes beats resuming onto a corrupt tail.
+  - **Journal writes are best-effort but not silent.** A failed write never
+    aborts a download — losing resumability is much better than failing a
+    transfer that is otherwise fine — but it is surfaced through
+    `onJournalError` rather than swallowed, per this file's rule against
+    swallowing errors to keep a happy path clean.
+  - **Writes are throttled** (8 MiB or 5 s by default, both configurable).
+    Bytes-only never persists on a stalled-but-alive connection; time-only
+    writes constantly on a fast one.
+  - `ExpoDownloadJournalStore` is the usual unverified adapter: typechecks
+    against the real `.d.ts`, has never run, no test file, reachable at
+    `rn-local-llm/journal-store`.
 - **`TESTING.md` records all eight field conditions**, added 2026-08-09,
   satisfying the Testing section's "every one of them must have a test or a
   documented manual procedure." For each: what is genuinely covered today
   (citing test names), what that coverage explicitly does *not* prove, the
   device procedure, and pass criteria. Two things it surfaced that are worth
-  knowing without reading it: **condition 3 (force-quit resume) will fail
-  today for an implementation reason, not a testing one** — nothing persists
-  `bytesDownloaded` to durable storage, so a resume always restarts from
-  zero; and **conditions 4 and 7 have no procedure at all** because
-  generation doesn't exist, so writing one would be fiction.
+  knowing without reading it: **conditions 4 and 7 have no procedure at
+  all** because generation doesn't exist, so writing one would be fiction.
+  (It originally flagged condition 3 as failing for an implementation
+  reason rather than a testing one; the download journal has since closed
+  that, and the section is updated.)
 - **`TESTING.md`'s citations are machine-checked** by
   `src/testingDoc.test.ts`. A document whose value is "here is the evidence"
   is worthless once a test is renamed underneath it, and this repo's whole
