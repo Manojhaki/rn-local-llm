@@ -8,7 +8,12 @@ import {
   type TransferHandle,
   type TransferRequest,
 } from './downloadModel.ts';
-import { CancelledError, ChecksumMismatchError, DownloadInterruptedError } from './errors.ts';
+import {
+  CancelledError,
+  ChecksumMismatchError,
+  DownloadInterruptedError,
+  InsufficientDiskSpaceError,
+} from './errors.ts';
 import type { DownloadState } from './download.ts';
 import type { ModelManifest } from './manifest.ts';
 
@@ -122,8 +127,16 @@ class FakeStore implements ModelFileStore {
   readonly deleted: string[] = [];
   readonly moved: { from: string; to: string }[] = [];
   moveError: Error | undefined;
+  /** Generous by default, so tests opt in to disk pressure rather than tripping over it. */
+  freeBytes = Number.MAX_SAFE_INTEGER;
+  freeDiskCalls = 0;
   /** Ordered log of every side effect, for asserting that verify precedes move. */
   readonly log: string[] = [];
+
+  async freeDiskBytes(): Promise<number> {
+    this.freeDiskCalls += 1;
+    return this.freeBytes;
+  }
 
   async delete(path: string): Promise<void> {
     this.deleted.push(path);
@@ -152,12 +165,15 @@ function run(
     resumeFromBytes?: number;
     manifestOverrides?: Partial<ModelManifest>;
     moveError?: Error;
+    freeBytes?: number;
+    diskHeadroomBytes?: number;
   } = {}
 ): { handle: ReturnType<typeof downloadModel>; harness: Harness } {
   const transfer = new FakeTransfer(opts.scripts ?? [{ kind: 'succeed', emitProgress: TOTAL_BYTES }]);
   const hasher = new FakeHasher(opts.hashes ?? [GOOD_SHA]);
   const store = new FakeStore();
   if (opts.moveError) store.moveError = opts.moveError;
+  if (opts.freeBytes !== undefined) store.freeBytes = opts.freeBytes;
   const states: DownloadState[] = [];
 
   const handle = downloadModel({
@@ -169,10 +185,24 @@ function run(
     store,
     ...(opts.maxAttempts === undefined ? {} : { maxAttempts: opts.maxAttempts }),
     ...(opts.resumeFromBytes === undefined ? {} : { resumeFromBytes: opts.resumeFromBytes }),
+    ...(opts.diskHeadroomBytes === undefined ? {} : { diskHeadroomBytes: opts.diskHeadroomBytes }),
     onStateChange: (s) => states.push(s),
   });
 
   return { handle, harness: { transfer, hasher, store, states } };
+}
+
+/**
+ * Yields until the transfer is actually in flight. The free-disk precheck
+ * is async, so a `cancel()` issued synchronously after `downloadModel()`
+ * lands *before* any transfer starts — a genuinely different case, covered
+ * by its own test.
+ */
+async function whenTransferring(harness: Harness): Promise<void> {
+  for (let i = 0; i < 50 && harness.transfer.requests.length === 0; i += 1) {
+    await Promise.resolve();
+  }
+  assert.ok(harness.transfer.requests.length > 0, 'expected a transfer to have started');
 }
 
 describe('downloadModel — happy path', () => {
@@ -372,13 +402,15 @@ describe('downloadModel — hashing and move failures', () => {
 
 describe('downloadModel — cancellation', () => {
   test('cancelling mid-transfer rejects with CancelledError', async () => {
-    const { handle } = run({ scripts: [{ kind: 'pending' }] });
+    const { handle, harness } = run({ scripts: [{ kind: 'pending' }] });
+    await whenTransferring(harness);
     handle.cancel();
     await assert.rejects(handle.result, CancelledError);
   });
 
   test('cancelling propagates to the transport', async () => {
     const { handle, harness } = run({ scripts: [{ kind: 'pending' }] });
+    await whenTransferring(harness);
     handle.cancel();
     await assert.rejects(handle.result);
     assert.equal(harness.transfer.cancelCount, 1);
@@ -386,6 +418,7 @@ describe('downloadModel — cancellation', () => {
 
   test('cancelling leaves the partial file on disk so it can be resumed later', async () => {
     const { handle, harness } = run({ scripts: [{ kind: 'pending' }] });
+    await whenTransferring(harness);
     handle.cancel();
     await assert.rejects(handle.result);
     assert.deepEqual(harness.store.deleted, []);
@@ -393,6 +426,7 @@ describe('downloadModel — cancellation', () => {
 
   test('cancelling reaches the cancelled status', async () => {
     const { handle, harness } = run({ scripts: [{ kind: 'pending' }] });
+    await whenTransferring(harness);
     handle.cancel();
     await assert.rejects(handle.result);
     assert.equal(harness.states.at(-1)?.status, 'cancelled');
@@ -400,6 +434,7 @@ describe('downloadModel — cancellation', () => {
 
   test('a cancelled download never moves anything into place', async () => {
     const { handle, harness } = run({ scripts: [{ kind: 'pending' }] });
+    await whenTransferring(harness);
     handle.cancel();
     await assert.rejects(handle.result);
     assert.deepEqual(harness.store.moved, []);
@@ -407,6 +442,7 @@ describe('downloadModel — cancellation', () => {
 
   test('cancel is idempotent', async () => {
     const { handle, harness } = run({ scripts: [{ kind: 'pending' }] });
+    await whenTransferring(harness);
     handle.cancel();
     handle.cancel();
     handle.cancel();
@@ -423,9 +459,20 @@ describe('downloadModel — cancellation', () => {
 
   test('a cancelled download is not retried', async () => {
     const { handle, harness } = run({ scripts: [{ kind: 'pending' }, { kind: 'succeed' }], maxAttempts: 3 });
+    await whenTransferring(harness);
     handle.cancel();
     await assert.rejects(handle.result, CancelledError);
     assert.equal(harness.transfer.requests.length, 1);
+  });
+
+  test('cancelling before the preflight check resolves still cancels', async () => {
+    // cancel() lands while the reducer is still `idle` — the disk check
+    // hasn't resolved, so no transfer has started. An earlier version
+    // gated cancel() on the reducer's status and silently dropped this.
+    const { handle, harness } = run({ scripts: [{ kind: 'pending' }] });
+    handle.cancel(); // deliberately synchronous — no waiting for the transfer
+    await assert.rejects(handle.result, CancelledError);
+    assert.deepEqual(harness.transfer.requests, []);
   });
 
   test('cancels even a transport that never settles after cancel()', async () => {
@@ -434,9 +481,71 @@ describe('downloadModel — cancellation', () => {
     // promise, so this only passes because the orchestrator races its own
     // cancellation signal rather than awaiting the transport alone.
     const { handle, harness } = run({ scripts: [{ kind: 'hang' }] });
+    await whenTransferring(harness);
     handle.cancel();
     await assert.rejects(handle.result, CancelledError);
     assert.equal(harness.transfer.cancelCount, 1);
+  });
+});
+
+describe('downloadModel — free-disk precheck', () => {
+  test('rejects with InsufficientDiskSpaceError when there is not enough room', async () => {
+    const { handle } = run({ freeBytes: 10 });
+    await assert.rejects(handle.result, (err: unknown) => {
+      assert.ok(err instanceof InsufficientDiskSpaceError);
+      assert.equal(err.requiredBytes, TOTAL_BYTES);
+      assert.equal(err.availableBytes, 10);
+      return true;
+    });
+  });
+
+  test('never starts a transfer it knows cannot finish', async () => {
+    const { handle, harness } = run({ freeBytes: 10 });
+    await assert.rejects(handle.result);
+    assert.deepEqual(harness.transfer.requests, []);
+  });
+
+  test('emits no download state, because no download began', async () => {
+    const { handle, harness } = run({ freeBytes: 10 });
+    await assert.rejects(handle.result);
+    assert.deepEqual(harness.states, []);
+  });
+
+  test('does not retry a disk-space failure — retrying cannot create space', async () => {
+    const { handle, harness } = run({ freeBytes: 10, maxAttempts: 3 });
+    await assert.rejects(handle.result, InsufficientDiskSpaceError);
+    assert.equal(harness.store.freeDiskCalls, 1);
+  });
+
+  test('proceeds when there is exactly enough room', async () => {
+    const { handle } = run({ freeBytes: TOTAL_BYTES });
+    const result = await handle.result;
+    assert.equal(result.path, '/models/model.gguf');
+  });
+
+  test('applies the configured headroom margin', async () => {
+    const { handle } = run({ freeBytes: TOTAL_BYTES, diskHeadroomBytes: 500 });
+    await assert.rejects(handle.result, (err: unknown) => {
+      assert.ok(err instanceof InsufficientDiskSpaceError);
+      assert.equal(err.requiredBytes, TOTAL_BYTES + 500);
+      return true;
+    });
+  });
+
+  test('only requires the bytes still missing when resuming', async () => {
+    // 400 of 1000 bytes already on disk, so 600 free is enough.
+    const { handle } = run({ resumeFromBytes: 400, freeBytes: 600 });
+    const result = await handle.result;
+    assert.equal(result.path, '/models/model.gguf');
+  });
+
+  test('checks the disk once up front, not on every attempt', async () => {
+    const { handle, harness } = run({
+      scripts: [{ kind: 'fail' }, { kind: 'succeed', emitProgress: TOTAL_BYTES }],
+    });
+    await handle.result;
+    assert.equal(harness.store.freeDiskCalls, 1);
+    assert.equal(harness.transfer.requests.length, 2);
   });
 });
 

@@ -99,7 +99,7 @@ Do not start a milestone before the previous one has its tests passing on physic
 ## Engineering rules
 
 - TypeScript strict mode. No `any`, no non-null assertions.
-- **Typed errors, always.** A discriminated union: `InsufficientMemory`, `ModelNotFound`, `ChecksumMismatch`, `DownloadInterrupted`, `BackendUnavailable`, `Cancelled`, `ContextOverflow`. Never throw a bare string. Never swallow an error to keep a happy path clean.
+- **Typed errors, always.** A discriminated union: `InsufficientMemory`, `ModelNotFound`, `ChecksumMismatch`, `DownloadInterrupted`, `InsufficientDiskSpace`, `BackendUnavailable`, `Cancelled`, `ContextOverflow`. Never throw a bare string. Never swallow an error to keep a happy path clean. (`InsufficientDiskSpace` was added 2026-08-09 by explicit decision — the original brief listed seven kinds and had no member for the downloader's required free-disk precheck.)
 - Every public function documents its failure modes in TSDoc.
 - No new runtime dependencies without justification. This library will be installed by people who care about bundle size.
 - Native memory allocations must have a documented owner and release path.
@@ -154,7 +154,7 @@ than none, because it will be believed.
 |---|---|
 | M0 — Skeleton | **Not started.** No native code exists. `/ios`, `/android`, `/cpp`, `/example`, `/benchmarks` do not exist. This environment has no `xcodebuild`, `sdkmanager`, or `adb` — M0 is unstartable here, not just unstarted. |
 | M1 | Not started. Blocked on M0. |
-| M2 — The operations layer | **Partially started, deliberately out of milestone order** (see "Decisions already made" below). Built so far, as pure TypeScript with no native dependency: the model manifest schema + validation, the model registry, the memory guard's preflight decision logic, checksum-mismatch detection, the download state machine (the orchestration/retry logic, not the transport), and the global load lock (locked decision #4's "one model resident at a time," as a state machine). Also built, but **unverified beyond `tsc --noEmit`** since both depend on real native modules this environment can't link or run: `src/hashing.ts`'s `computeSha256()` and `src/downloadTransport.ts`'s `startDownload()` (`expo-file-system` + `react-native-quick-crypto`, see "Decisions already made"). The orchestrator (`downloadModel.ts`) that sequences transfer → hash → checksum → atomic move **is built and genuinely tested** — its ports are injected, so 31 assertions exercise the real retry/cancel/cleanup logic against fakes with no device. **Not built:** free-disk precheck (blocked — needs an error kind that doesn't exist, see open question 6), Wi-Fi-only gating (needs a network-state source, another native dependency decision), OS memory-pressure subscription (needs native), unload-on-background (needs native), and actually loading/unloading a model in a backend (needs M0/M1 — the load lock only tracks *which* model id should be resident, not the native residency itself). |
+| M2 — The operations layer | **Partially started, deliberately out of milestone order** (see "Decisions already made" below). Built so far, as pure TypeScript with no native dependency: the model manifest schema + validation, the model registry, the memory guard's preflight decision logic, checksum-mismatch detection, the download state machine (the orchestration/retry logic, not the transport), and the global load lock (locked decision #4's "one model resident at a time," as a state machine). Also built, but **unverified beyond `tsc --noEmit`** since both depend on real native modules this environment can't link or run: `src/hashing.ts`'s `computeSha256()` and `src/downloadTransport.ts`'s `startDownload()` (`expo-file-system` + `react-native-quick-crypto`, see "Decisions already made"). The orchestrator (`downloadModel.ts`) that sequences transfer → hash → checksum → atomic move **is built and genuinely tested** — its ports are injected, so 31 assertions exercise the real retry/cancel/cleanup logic against fakes with no device. The free-disk precheck (`diskGuard.ts` + an eighth error kind, `InsufficientDiskSpace`) is built and tested too. **Not built:** Wi-Fi-only gating (needs a network-state source, another native dependency decision), OS memory-pressure subscription (needs native), unload-on-background (needs native), and actually loading/unloading a model in a backend (needs M0/M1 — the load lock only tracks *which* model id should be resident, not the native residency itself). |
 | M3–M4 | Not started. Blocked on M0 and M2. |
 | Cross-cutting | Typed error union: **done and verified.** All 7 documented kinds (`InsufficientMemory`, `ModelNotFound`, `ChecksumMismatch`, `DownloadInterrupted`, `BackendUnavailable`, `Cancelled`, `ContextOverflow`) have classes; both exhaustiveness guards (`EveryKindHasAClass` in `errors.ts`, `SAMPLES` in `errors.test.ts`) were manually broken and confirmed to fail the build, then restored. |
 
@@ -167,14 +167,16 @@ LICENSE                 MIT
 package.json             private, 0.0.0, zero direct runtime deps (2 peerDependencies, 2 matching devDependencies)
 .npmrc                   omit=peer, so local `npm install` doesn't resolve the peer tree
 tsconfig.json            strict + noUncheckedIndexedAccess + exactOptionalPropertyTypes + noEmit
-src/errors.ts            the typed error union (7 kinds)
-src/errors.test.ts       69 assertions
+src/errors.ts            the typed error union (8 kinds)
+src/errors.test.ts       78 assertions
 src/manifest.ts          ModelManifest type + validateManifest() (hand-rolled, no schema library)
 src/manifest.test.ts     13 assertions
 src/registry.ts          ModelRegistry: register/resolve/list/fromManifestList
 src/registry.test.ts     7 assertions
 src/memoryGuard.ts       checkMemoryCapability() — pure decision logic, RAM reading itself is native/M0 work
 src/memoryGuard.test.ts  5 assertions
+src/diskGuard.ts         checkDiskCapacity() — free-disk preflight, mirrors memoryGuard.ts; reading free space is native
+src/diskGuard.test.ts    11 assertions
 src/checksum.ts          assertChecksumMatches() — pure comparison logic
 src/checksum.test.ts     3 assertions
 src/download.ts          download state machine: transition(state, event) — pure reducer, no I/O or transport
@@ -182,13 +184,13 @@ src/download.test.ts     34 assertions
 src/loadLock.ts          global load lock: transitionLoadLock(state, event) — pure reducer, no native residency
 src/loadLock.test.ts     20 assertions
 src/downloadModel.ts     the orchestrator: downloadModel() — transfer → hash → checksum → atomic move, ports injected
-src/downloadModel.test.ts 31 assertions, all against fakes — no device needed
+src/downloadModel.test.ts 40 assertions, all against fakes — no device needed
 src/hashing.ts           computeSha256() via expo-file-system + react-native-quick-crypto — typechecked, never run, not exported from index.ts
 src/downloadTransport.ts ExpoModelTransfer implements downloadModel.ts's ModelTransfer port — typechecked, never run, not exported from index.ts
 src/index.ts             public entry point, re-exports everything above except hashing.ts and downloadTransport.ts
 ```
 
-`npm run check` (typecheck + `node --test`) passes: 182 assertions, 0 failures.
+`npm run check` (typecheck + `node --test`) passes: 211 assertions, 0 failures.
 `hashing.ts` and `downloadTransport.ts` have no test files and aren't exercised by that count — see "Decisions already made" for why.
 There is still no build step — `tsconfig.json` is `noEmit` and the package is
 `private`. Both still need to change before this can be published or consumed
@@ -406,6 +408,16 @@ calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
   restart-from-zero honest); a transport failure leaves the temp file
   alone so the retry resumes; the move happens while still `verifying`, so
   a failed move lands in `failed` rather than a `complete` that lied.
+- **The free-disk precheck runs once, before the state machine starts, and
+  is never retried.** Running it before `start` means a refusal leaves no
+  download state to report and nothing on disk to clean up — which is the
+  whole reason it needed its own error kind rather than reusing
+  `DownloadInterrupted`. It is not re-run per attempt (retrying cannot
+  create space, and a second check would just re-fail), and it reserves
+  only the bytes *still to be written*, so a resumed download doesn't
+  demand room for bytes already on disk. It assumes temp and destination
+  share a filesystem so the final move is a rename; if a host ever splits
+  them across volumes, the check would need roughly double.
 - **Cancellation does not trust the transport.** `downloadModel()` races
   every await against its own cancellation signal rather than just
   awaiting the transport's promise. Locked decision #5 says everything
@@ -415,6 +427,16 @@ calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
   is a test (`cancels even a transport that never settles after cancel()`)
   using a deliberately badly-behaved fake; it caught this exact bug during
   development, when the signal existed but was never fired.
+- **`cancel()` is not gated on the reducer's status.** Adding the async
+  disk precheck opened a window where the reducer is still `idle` when a
+  caller cancels — and an earlier version, which returned early unless the
+  status was `downloading`/`verifying`, silently dropped cancels issued in
+  that window. `cancel()` now always records the cancellation and fires
+  the signal, and only *dispatches* to the reducer when the reducer can
+  accept it. `runAttempt()` also re-checks before calling
+  `transfer.start()`, because starting a transfer after cancellation would
+  leak it — `cancel()` has already run and had no handle to forward to.
+  Both paths have tests; both were real bugs, not hypotheticals.
 - **Cancelling leaves the partial temp file on disk.** Deleting it would
   make an explicit cancel unresumable, which is the opposite of what this
   library is for on a 1.2 GB download over mobile data. Reclaiming temp
@@ -447,6 +469,25 @@ calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
   operation from tearing down a fully resident one. Like the other
   reducers, this one holds no native memory and does no I/O; it only tracks
   which model id *should* be resident.
+
+## Adding an error kind
+
+It is a breaking change for consumers that switch exhaustively. Four edits:
+
+1. Add the string to `LocalLlmErrorKind` in `errors.ts`.
+2. Add a class extending `LocalLlmErrorBase<'YourKind'>`, with typed fields,
+   a message carrying the numbers a developer needs, and TSDoc stating when
+   it is raised and what recovery exists.
+3. Add it to the `LocalLlmError` union.
+4. Add a sample to `SAMPLES` in `errors.test.ts`.
+
+Steps 1 and 3 without 2 and 4 will fail the build. That is intended, and it
+was confirmed working when `InsufficientDiskSpace` was added on 2026-08-09:
+doing edits 1–3 and running `tsc` produced exactly the expected
+`SAMPLES`-missing-property error, which edit 4 then cleared.
+
+Also update the kind list in the "Engineering rules" section above — it
+enumerates the union by hand and will otherwise go stale.
 
 ## Open questions — decide before building
 
@@ -483,18 +524,16 @@ calling it done; that's why no `/ios`, `/android`, or `/cpp` files exist yet.
    service, or accepting that an Android transfer pauses when the app is
    fully backgrounded rather than continuing) if it turns out not to
    survive backgrounding the way iOS does.
-6. **The free-disk precheck needs an eighth error kind, and that's a
-   breaking change.** The Downloader spec requires "free-disk precheck
-   before starting, with headroom margin," but `LocalLlmErrorKind` has no
-   member for it — the closest, `DownloadInterrupted`, is semantically
-   wrong (nothing was interrupted; the download never started). Adding
-   `InsufficientDiskSpace` is the right fix, and is the four-edit change
-   this file's "Adding an error kind" section describes — but it is a
-   breaking change for consumers that switch exhaustively, and the working
-   style says to ask before adding public API surface. **Not done — needs
-   a decision.** Until then `downloadModel()` has no precheck, and a
-   disk-full condition surfaces as whatever the transport rejects with,
-   wrapped as `DownloadInterrupted`.
+6. ~~The free-disk precheck needs an eighth error kind.~~ **Resolved
+   2026-08-09: `InsufficientDiskSpace` was added**, by explicit decision,
+   following the four-edit procedure above. `DownloadInterrupted` would
+   have been semantically wrong — nothing is interrupted when the download
+   never started. `diskGuard.ts`'s `checkDiskCapacity()` holds the
+   decision logic (mirroring `memoryGuard.ts`), and `downloadModel()` runs
+   it once before the first byte is requested. Reading actual free space
+   is native, so it arrives through the `ModelFileStore.freeDiskBytes()`
+   port. A disk-space failure is deliberately **not** retried — retrying
+   cannot create space.
 7. **Wi-Fi-only mode (default) with cellular opt-in isn't built.** It needs
    a network-state source, which is another native dependency decision
    (`@react-native-community/netinfo` or equivalent) that hasn't been

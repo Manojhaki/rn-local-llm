@@ -4,6 +4,7 @@ export {
   ModelNotFoundError,
   ChecksumMismatchError,
   DownloadInterruptedError,
+  InsufficientDiskSpaceError,
   BackendUnavailableError,
   CancelledError,
   ContextOverflowError,
@@ -23,6 +24,8 @@ export {
 export { ModelRegistry } from './registry.ts';
 
 export { checkMemoryCapability, type MemoryCapabilityOptions } from './memoryGuard.ts';
+
+export { checkDiskCapacity, type DiskCapacityRequest } from './diskGuard.ts';
 
 export { assertChecksumMatches } from './checksum.ts';
 

@@ -13,6 +13,7 @@ export type LocalLlmErrorKind =
   | 'ModelNotFound'
   | 'ChecksumMismatch'
   | 'DownloadInterrupted'
+  | 'InsufficientDiskSpace'
   | 'BackendUnavailable'
   | 'Cancelled'
   | 'ContextOverflow';
@@ -172,6 +173,42 @@ export class DownloadInterruptedError extends LocalLlmErrorBase<'DownloadInterru
 }
 
 /**
+ * Raised by the downloader's preflight check when the device doesn't have
+ * room for the model, including any configured headroom margin. Raised
+ * *before* the transfer starts — nothing has been written and there is no
+ * partial file to clean up, which is exactly why this isn't a
+ * `DownloadInterrupted`.
+ *
+ * `requiredBytes` counts only the bytes still to be written (a resumed
+ * download needs less than a fresh one) plus headroom, not the model's
+ * full size.
+ *
+ * Recovery: free disk space and retry, or resolve a manifest for a smaller
+ * quantization.
+ */
+export class InsufficientDiskSpaceError extends LocalLlmErrorBase<'InsufficientDiskSpace'> {
+  readonly modelId: string;
+  readonly requiredBytes: number;
+  readonly availableBytes: number;
+
+  constructor(
+    modelId: string,
+    requiredBytes: number,
+    availableBytes: number,
+    options?: LocalLlmErrorOptions
+  ) {
+    super(
+      'InsufficientDiskSpace',
+      `Model "${modelId}" needs ${requiredBytes} bytes of free disk space but only ${availableBytes} are available.`,
+      options
+    );
+    this.modelId = modelId;
+    this.requiredBytes = requiredBytes;
+    this.availableBytes = availableBytes;
+  }
+}
+
+/**
  * Raised when a manifest requires a backend (`llama.cpp` or `executorch`)
  * that isn't available in the current native build.
  *
@@ -240,6 +277,7 @@ export type LocalLlmError =
   | ModelNotFoundError
   | ChecksumMismatchError
   | DownloadInterruptedError
+  | InsufficientDiskSpaceError
   | BackendUnavailableError
   | CancelledError
   | ContextOverflowError;

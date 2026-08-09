@@ -17,6 +17,7 @@
  */
 
 import { assertChecksumMatches } from './checksum.ts';
+import { checkDiskCapacity } from './diskGuard.ts';
 import { initialDownloadState, transition, type DownloadState, type DownloadEvent } from './download.ts';
 import { CancelledError, DownloadInterruptedError, type LocalLlmError } from './errors.ts';
 import type { ModelManifest } from './manifest.ts';
@@ -58,6 +59,8 @@ export interface ModelFileStore {
   delete(path: string): Promise<void>;
   /** Must be atomic — a half-moved model file is worse than no model file. */
   move(fromPath: string, toPath: string): Promise<void>;
+  /** Free space on the volume holding the temp path, for the preflight check. */
+  freeDiskBytes(): Promise<number>;
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +87,12 @@ export interface DownloadModelOptions {
    * @default 3
    */
   readonly maxAttempts?: number;
+  /**
+   * Free disk space to insist on beyond the bytes still to be written,
+   * checked once before the transfer starts.
+   * @default 0
+   */
+  readonly diskHeadroomBytes?: number;
   readonly onStateChange?: (state: DownloadState) => void;
 }
 
@@ -105,6 +114,7 @@ export interface DownloadModelHandle {
    */
   cancel(): void;
   /**
+   * @throws {InsufficientDiskSpaceError} if the preflight check finds too little free space. Raised before any transfer begins.
    * @throws {ChecksumMismatchError} if the bytes fail verification on the final attempt.
    * @throws {DownloadInterruptedError} if the transfer, hashing, or move fails on the final attempt.
    * @throws {CancelledError} if {@link DownloadModelHandle.cancel} was called.
@@ -116,6 +126,7 @@ export interface DownloadModelHandle {
  * Downloads, verifies, and installs the model described by `manifest`.
  *
  * Guarantees worth relying on:
+ * - Free disk space is checked before the first byte is requested.
  * - Nothing reaches `destinationPath` until its SHA-256 matches the manifest.
  * - A checksum failure deletes the temp file before retrying, so a retry
  *   can never re-verify the same bad bytes.
@@ -190,6 +201,11 @@ export function downloadModel(options: DownloadModelOptions): DownloadModelHandl
   }
 
   async function runAttempt(): Promise<void> {
+    // Starting a transfer after cancellation would leak it: `cancel()` has
+    // already run and had no handle to pass the cancel along to, so the
+    // native transfer would keep going with nothing left to stop it.
+    throwIfCancelled();
+
     const handle = transfer.start({
       url,
       tempPath,
@@ -253,10 +269,26 @@ export function downloadModel(options: DownloadModelOptions): DownloadModelHandl
   }
 
   async function run(): Promise<DownloadModelResult> {
+    const resumeFromBytes = options.resumeFromBytes ?? 0;
+
+    // Preflight runs before the state machine starts: if there's no room,
+    // no download ever began, so there is no download state to report and
+    // nothing on disk to clean up. That's exactly why this raises
+    // InsufficientDiskSpace rather than DownloadInterrupted.
+    checkDiskCapacity({
+      modelId: manifest.id,
+      fileSizeBytes: manifest.fileSizeBytes,
+      alreadyDownloadedBytes: resumeFromBytes,
+      availableBytes: await untilCancelled(store.freeDiskBytes()),
+      ...(options.diskHeadroomBytes === undefined ? {} : { headroomBytes: options.diskHeadroomBytes }),
+    });
+
+    throwIfCancelled();
+
     dispatch({
       type: 'start',
       totalBytes: manifest.fileSizeBytes,
-      resumeFromBytes: options.resumeFromBytes ?? 0,
+      resumeFromBytes,
     });
 
     for (let attempt = 1; ; attempt += 1) {
@@ -282,11 +314,18 @@ export function downloadModel(options: DownloadModelOptions): DownloadModelHandl
 
   return {
     cancel() {
-      if (cancelled || (state.status !== 'downloading' && state.status !== 'verifying')) {
+      if (cancelled) {
         return;
       }
       cancelled = true;
-      dispatch({ type: 'cancel' });
+      // The reducer only accepts `cancel` from an active status, but
+      // cancellation itself must work from any point — including before
+      // the preflight check has resolved, when the reducer is still idle.
+      // Gating the whole method on the reducer's status would silently
+      // drop a cancel issued in that window.
+      if (state.status === 'downloading' || state.status === 'verifying') {
+        dispatch({ type: 'cancel' });
+      }
       activeTransfer?.cancel();
       signalCancellation();
     },

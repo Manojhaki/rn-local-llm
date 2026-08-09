@@ -23,10 +23,11 @@ can actually be loaded or run yet. What's implemented so far is pure
 TypeScript: the typed error union, the model manifest schema and validation,
 the model registry, the memory guard's preflight decision logic, the
 download state machine's orchestration/retry logic (not its transport), and
-the global load lock that enforces one model resident at a time, and the
-download orchestrator that sequences transfer → hash → checksum → atomic
-move (its I/O is injected, so its retry, cancellation, and cleanup logic
-is genuinely tested against fakes).
+the global load lock that enforces one model resident at a time, the
+free-disk preflight check, and the download orchestrator that sequences
+precheck → transfer → hash → checksum → atomic move (its I/O is injected,
+so its retry, cancellation, and cleanup logic is genuinely tested against
+fakes).
 
 The two adapters that touch real native modules — SHA-256 hashing and the
 download transport — typecheck against their real dependencies but have
